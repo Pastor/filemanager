@@ -32,7 +32,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(app.theme.base()), area);
 
-    let [main, hints] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    // Подсказки занимают одну строку, а если не влезают — две.
+    let hint_lines = hint_rows(app, (area.width as usize).saturating_sub(1));
+    let height = hint_lines.len().max(1) as u16;
+    let [main, hints] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(height)]).areas(area);
 
     match app.hidden {
         _ if app.large.is_some() => draw_large(frame, main, app),
@@ -48,7 +52,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    draw_hints(frame, hints, app);
+    draw_hints(frame, hints, app, hint_lines);
 
     match &app.mode {
         Mode::Normal => {}
@@ -359,113 +363,203 @@ pub fn shorten_path(path: &str, width: usize) -> String {
     out
 }
 
-fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
+/// Строка подсказок. Сообщение о результате действия заменяет её первую строку.
+fn draw_hints(frame: &mut Frame, area: Rect, app: &App, mut lines: Vec<Line<'static>>) {
     let theme = app.theme;
+    let area = area.inner(Margin::new(1, 0));
     if let Some(status) = &app.status {
         let style = if status.error {
             theme.error()
         } else {
             Style::default()
         };
-        let text = truncate_width(&format!(" {}", status.text), area.width as usize);
-        frame.render_widget(Paragraph::new(Line::styled(text, style)), area);
-        return;
+        let text = truncate_width(&status.text, area.width as usize);
+        let line = Line::styled(text, style);
+        if lines.is_empty() {
+            lines.push(line);
+        } else {
+            lines[0] = line;
+        }
     }
-
-    let width = (area.width as usize).saturating_sub(1);
-    if app.large.is_some() {
-        let t = app.text();
-        let hints = [
-            ("↑↓", t.hint_move),
-            ("→←", t.hint_in_out),
-            ("Esc", t.hint_exit),
-            ("q", t.hint_quit),
-        ];
-        let line = hint_line(&hints, width, &theme);
-        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
-        return;
-    }
-    if let Some(finder) = &app.finder {
-        let line = finder_line(finder, width, &theme, app.text());
-        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
-        return;
-    }
-    if app.viewer_focused()
-        && let Some(search) = app.viewer.as_ref().and_then(|v| v.search.as_ref())
-    {
-        let line = search_line(search, width, &theme, app.text());
-        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
-        return;
-    }
-    let hints = mode_hints(app);
-    let line = hint_line(&hints, width, &theme);
-    frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Клавиши текущего режима для строки подсказок.
+/// Строки подсказок для текущего состояния: одна или две.
+fn hint_rows(app: &App, width: usize) -> Vec<Line<'static>> {
+    let theme = app.theme;
+    let t = app.text();
+    // Поиск показывает строку ввода — она всегда одна.
+    if matches!(app.mode, Mode::Normal) && app.large.is_none() {
+        if let Some(finder) = &app.finder {
+            return vec![finder_line(finder, width, &theme, t)];
+        }
+        if app.viewer_focused()
+            && let Some(search) = app.viewer.as_ref().and_then(|v| v.search.as_ref())
+        {
+            return vec![search_line(search, width, &theme, t)];
+        }
+    }
+    wrap_hints(&mode_hints(app), width, &theme)
+}
+
+/// Раскладывает подсказки по строкам: что не влезло в первую, идёт во вторую;
+/// не влезшее и во вторую заменяется многоточием — полный список в справке.
+fn wrap_hints(
+    hints: &[(&'static str, &'static str)],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut used = 0;
+    let mut split = hints.len();
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        let item = key.width() + 1 + desc.width() + 2;
+        if used + item > width {
+            split = i;
+            break;
+        }
+        used += item;
+    }
+    if split == hints.len() || split == 0 {
+        return vec![hint_line(hints, width, theme)];
+    }
+    vec![
+        hint_line(&hints[..split], width, theme),
+        hint_line(&hints[split..], width, theme),
+    ]
+}
+
+/// Клавиши текущего режима — только те, что сейчас что-то сделают.
 fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let t = app.text();
     match &app.mode {
+        Mode::Normal if app.large.is_some() => large_hints(app),
         Mode::Normal if app.editor.is_some() => vec![
             ("Ctrl+S", t.hint_save),
             ("Esc", t.hint_exit),
             ("Tab", t.hint_indent),
             ("Shift+Tab", t.hint_dedent),
         ],
-        Mode::EditorSave => vec![("y", t.save), ("Esc", t.cancel)],
-        Mode::EditorExit => vec![("y", t.save), ("n", t.discard), ("Esc", t.keep_editing)],
+        Mode::Normal if app.viewer_focused() => viewer_hints(app),
+        Mode::Normal => files_hints(app),
+        Mode::EditorSave => vec![("y", t.save), ("Esc q", t.cancel)],
+        Mode::EditorExit => vec![("y", t.save), ("n", t.discard), ("Esc q", t.keep_editing)],
         Mode::Pack(_) => pack_hints(t),
-        Mode::Help { .. } => vec![("↑↓", t.hint_scroll), ("Esc", t.hint_close)],
+        Mode::Help { .. } => vec![("↑↓", t.hint_scroll), ("Esc q", t.hint_close)],
         Mode::Settings(_) => settings_hints(t),
-        Mode::Normal if app.viewer_focused() => {
-            let wrap = app.viewer.as_ref().is_some_and(|v| v.wrap);
-            let mut hints = vec![("↑↓", t.hint_scroll)];
-            if !wrap {
-                hints.push(("←→", t.hint_shift));
-            }
-            hints.extend([
-                ("e", t.hint_edit),
-                ("w", t.hint_wrap),
-                ("/", t.hint_search),
-                ("Tab", t.hint_panel),
-                ("Esc", t.hint_close),
-            ]);
-            hints
-        }
-        Mode::Normal => vec![
-            ("?", t.hint_help),
-            ("↑↓", t.hint_move),
-            ("→←", t.hint_in_out),
-            ("Tab", t.hint_panel),
-            ("p", t.hint_preview),
-            ("/", t.hint_search),
-            ("f", t.hint_find),
-            ("Space", t.hint_mark),
-            ("c", t.hint_copy),
-            ("m", t.hint_move_to),
-            ("d", t.hint_delete),
-            ("a", t.hint_pack),
-            ("l", t.hint_large),
-            ("o", t.hint_settings),
-            ("P", t.hint_hide),
-            ("<>", t.hint_width),
-            ("1-3", t.hint_columns),
-            (".", t.hint_hidden),
-            ("q", t.hint_quit),
-        ],
         Mode::ConfirmDelete { permanent, .. } => vec![
             (if *permanent { "D" } else { "d" }, t.confirm),
-            ("Esc", t.cancel),
+            ("Esc q", t.cancel),
         ],
         Mode::Job(job) if job.conflict.is_some() => conflict_hints(t).concat(),
-        Mode::Job(_) => vec![("Esc", t.cancel)],
+        Mode::Job(_) => vec![("Esc q", t.cancel)],
     }
+}
+
+/// Подсказки файловой панели с учётом того, что сейчас возможно.
+fn files_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let t = app.text();
+    let panel = app.panel(app.active);
+    let has = !panel.entries.is_empty();
+    let two = app.hidden.is_none();
+    let here_writable = !crate::panel::in_archive(&panel.dir);
+    // Копировать и переносить есть куда: вторая панель видна, это не
+    // просмотр, не архив и не та же директория.
+    let other = app.panel(app.active.other());
+    let can_transfer = has
+        && two
+        && app.viewer.is_none()
+        && other.dir != panel.dir
+        && !crate::panel::in_archive(&other.dir);
+
+    let mut hints = vec![("?", t.hint_help)];
+    if has {
+        hints.push(("↑↓", t.hint_move));
+    }
+    hints.push(("→←", t.hint_in_out));
+    if two {
+        hints.push(("Tab", t.hint_panel));
+    }
+    if has {
+        hints.push(("Space", t.hint_mark));
+    }
+    if can_transfer {
+        hints.push(("c", t.hint_copy));
+        hints.push(("m", t.hint_move_to));
+    }
+    if has {
+        hints.push(("d", t.hint_delete));
+    }
+    hints.push(("p", t.hint_preview));
+    hints.push(("/", t.hint_search));
+    hints.push(("f", t.hint_find));
+    if has && here_writable {
+        hints.push(("a", t.hint_pack));
+    }
+    hints.push(("l", t.hint_large));
+    if panel.columns > 1 && has {
+        hints.push(("Shift+←→", t.hint_columns));
+    }
+    hints.push(("P", if two { t.hint_hide } else { t.hint_show }));
+    if two {
+        hints.push(("<>", t.hint_width));
+    }
+    hints.push(("1-3", t.hint_columns));
+    hints.push((".", t.hint_hidden));
+    hints.push(("o", t.hint_settings));
+    hints.push(("q", t.hint_quit));
+    hints
+}
+
+/// Подсказки просмотра: зависят от того, что в нём показано.
+fn viewer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let t = app.text();
+    let Some(viewer) = &app.viewer else {
+        return Vec::new();
+    };
+    let text = matches!(
+        viewer.content.as_ref().map(|c| &c.body),
+        Some(Body::Text(_))
+    );
+    let mut hints = vec![("?", t.hint_help)];
+    if viewer.content.is_some() {
+        hints.push(("↑↓", t.hint_scroll));
+    }
+    if text && !viewer.wrap {
+        hints.push(("←→", t.hint_shift));
+    }
+    if text
+        && viewer
+            .path
+            .as_deref()
+            .is_some_and(|p| !crate::panel::in_archive(p))
+    {
+        hints.push(("e", t.hint_edit));
+    }
+    if text {
+        hints.push(("w", t.hint_wrap));
+        hints.push(("/", t.hint_search));
+    }
+    hints.push(("Tab", t.hint_panel));
+    hints.push(("Esc q", t.hint_close));
+    hints
+}
+
+/// Подсказки режима «большие объекты».
+fn large_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let t = app.text();
+    let mut hints = vec![("?", t.hint_help)];
+    if app.large.as_ref().is_some_and(|l| !l.order.is_empty()) {
+        hints.push(("↑↓", t.hint_move));
+        hints.push(("→←", t.hint_in_out));
+    }
+    hints.push(("Esc q", t.hint_exit));
+    hints
 }
 
 /// Ответы на конфликт имён двумя строками: частые и «для всех».
 fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
     [
-        vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
+        vec![("r", t.replace), ("s", t.skip), ("Esc q", t.cancel)],
         vec![("R", t.replace_all), ("S", t.skip_all)],
     ]
 }
@@ -530,7 +624,7 @@ fn settings_hints(t: &'static Text) -> Vec<(&'static str, &'static str)> {
         ("↑↓", t.hint_move),
         ("←→", t.hint_change),
         ("Enter", t.save),
-        ("Esc", t.cancel),
+        ("Esc q", t.cancel),
     ]
 }
 
@@ -1222,6 +1316,11 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
     let rows = inner.height as usize;
     let width = inner.width as usize;
 
+    // Просмотру нечего показывать (поиск ещё ничего не нашёл) — он пуст.
+    if viewer.path.is_none() {
+        viewer.fit(rows, 0);
+        return;
+    }
     let Some(content) = &viewer.content else {
         viewer.fit(rows, 0);
         frame.render_widget(
@@ -1798,10 +1897,14 @@ mod tests {
         println!("{}", lines.join("\n"));
         assert!(lines[1].matches("src/").count() == 2, "{}", lines[1]);
         assert!(lines[1].contains("<DIR>"));
-        assert!(lines[11].contains("move"));
-        assert!(lines[11].contains("copy"));
+        // Подсказки в две строки, и видно всё доступное — вплоть до выхода.
+        let hints = format!("{}{}", lines[10], lines[11]);
+        assert!(hints.contains("? help"), "{hints}");
+        assert!(hints.contains("q quit"), "{hints}");
+        // Обе панели в одной директории — копировать некуда, подсказки нет.
+        assert!(!hints.contains("c copy"), "{hints}");
         // Счётчик позиции в нижней рамке.
-        assert!(lines[10].contains("1/32"));
+        assert!(lines[9].contains("1/32"));
     }
 
     #[test]
@@ -2075,7 +2178,7 @@ mod tests {
         );
         assert!(lines[2].contains("small"));
         assert!(lines[6].contains("3.9 K · 3 objects"), "{}", lines[6]);
-        assert!(lines[7].contains("Esc exit"));
+        assert!(lines[7].contains("Esc q exit"));
     }
 
     #[test]

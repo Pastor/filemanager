@@ -96,6 +96,10 @@ pub struct Preview {
     pub body: Body,
 }
 
+/// Имя потока загрузчика: по нему обработчик паник узнаёт, что паника
+/// перехвачена здесь и терминал восстанавливать не нужно.
+pub const LOADER_THREAD: &str = "preview-loader";
+
 /// Фоновый загрузчик просмотров.
 pub struct Loader {
     tx: Sender<(u64, PathBuf)>,
@@ -107,20 +111,36 @@ impl Loader {
     pub fn new() -> Self {
         let (tx, requests) = unbounded::<(u64, PathBuf)>();
         let (results, rx) = unbounded();
-        std::thread::spawn(move || {
-            while let Ok(mut request) = requests.recv() {
-                // Пока грузилось предыдущее, могли прийти новые запросы:
-                // нужен только последний.
-                while let Ok(newer) = requests.try_recv() {
-                    request = newer;
+        let spawned = std::thread::Builder::new()
+            .name(LOADER_THREAD.into())
+            .spawn(move || {
+                while let Ok(mut request) = requests.recv() {
+                    // Пока грузилось предыдущее, могли прийти новые запросы:
+                    // нужен только последний.
+                    while let Ok(newer) = requests.try_recv() {
+                        request = newer;
+                    }
+                    let stale = || !requests.is_empty();
+                    // Ошибка разбора одного необычного файла не должна убивать
+                    // поток: тогда все следующие просмотры зависли бы в загрузке.
+                    let preview = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        build(&request.1, &stale)
+                    }))
+                    .unwrap_or_else(|_| Preview {
+                        path: request.1.clone(),
+                        size: 0,
+                        modified: None,
+                        mode: String::new(),
+                        owner: String::new(),
+                        body: Body::Error("internal error while reading the file".into()),
+                    });
+                    if results.send((request.0, preview)).is_err() {
+                        break;
+                    }
                 }
-                let stale = || !requests.is_empty();
-                let preview = build(&request.1, &stale);
-                if results.send((request.0, preview)).is_err() {
-                    break;
-                }
-            }
-        });
+            });
+        // Без потока просмотр просто останется пустым; падать из-за этого незачем.
+        drop(spawned);
         Self { tx, rx, next: 0 }
     }
 

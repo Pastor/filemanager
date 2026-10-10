@@ -160,6 +160,19 @@ impl Panel {
         path
     }
 
+    /// Директория, в которую перейти оболочке после выхода. Изнутри архива —
+    /// туда, где лежит сам архив: временная папка к этому моменту удалена.
+    pub fn exit_dir(&self) -> PathBuf {
+        match self.mounts.first() {
+            Some(mount) => mount
+                .archive
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.dir.clone()),
+            None => self.dir.clone(),
+        }
+    }
+
     /// Текущая директория для показа.
     pub fn display_dir(&self) -> PathBuf {
         self.display_path(&self.dir)
@@ -527,5 +540,20 @@ mod tests {
             .unwrap();
         drop(panel);
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn exit_dir_leaves_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(root.join("inner")).unwrap();
+        let mut panel = Panel::open(tmp.path().to_path_buf(), 1, true).unwrap();
+        assert_eq!(panel.exit_dir(), tmp.path());
+        panel
+            .mount(tmp.path().join("a.zip"), root.clone(), true)
+            .unwrap();
+        panel.enter(true).unwrap();
+        // Внутри архива выходим туда, где лежит архив, а не во временную папку.
+        assert_eq!(panel.exit_dir(), tmp.path());
     }
 }

@@ -12,6 +12,7 @@ mod panel;
 mod preview;
 mod scan;
 mod search;
+mod shell;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -38,10 +39,22 @@ struct Args {
     /// Interface language: en | ru.
     #[arg(short, long)]
     lang: Option<Lang>,
+
+    /// On exit, write the active panel directory to this file.
+    #[arg(long, value_name = "FILE")]
+    cwd_file: Option<PathBuf>,
+
+    /// Print the shell function `f` that changes into the last directory on exit.
+    #[arg(long, value_name = "SHELL")]
+    shell_init: Option<shell::Shell>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(shell) = args.shell_init {
+        print!("{}", shell::init(shell));
+        return Ok(());
+    }
 
     // Испорченный конфиг не повод отказываться работать: стартуем на умолчаниях,
     // но при выходе его не перезаписываем, чтобы пользователь мог его починить.
@@ -77,7 +90,14 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| left.clone()),
     };
 
-    ui::run(left, right, cfg, cfg_ok)
+    let last = ui::run(left, right, cfg, cfg_ok)?;
+    // Оболочка читает файл после выхода и переходит в эту директорию: сама
+    // программа сменить каталог родительского процесса не может.
+    if let Some(file) = args.cwd_file {
+        std::fs::write(&file, last.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("cannot write {}", file.display()))?;
+    }
+    Ok(())
 }
 
 /// Проверяет, что путь существует и ведёт в директорию, и делает его абсолютным.

@@ -201,6 +201,18 @@ impl App {
             self.quit = true;
             return;
         }
+        self.status = None;
+        // Буква не из латиницы там, где ждут команду, — включена другая
+        // раскладка. Молча ничего не делать хуже, чем сказать об этом.
+        if !self.typing()
+            && let KeyCode::Char(c) = key.code
+            && c.is_alphabetic()
+            && !c.is_ascii()
+        {
+            let text = self.text().wrong_layout;
+            self.fail(text);
+            return;
+        }
         // Пока идёт операция или открыт диалог, клавиши принадлежат им.
         match self.mode {
             Mode::Normal => {}
@@ -233,15 +245,42 @@ impl App {
         } else if self.viewer_focused() {
             self.on_viewer_key(key.code);
         } else {
-            self.on_files_key(key.code);
+            self.on_files_key(key);
         }
         self.sync_viewer();
     }
 
+    /// Сейчас вводится текст: буквы — это текст, а не команды.
+    fn typing(&self) -> bool {
+        match self.mode {
+            Mode::Pack(_) => true,
+            Mode::Normal => {
+                self.editor.is_some()
+                    || self.finder.is_some()
+                    || (self.viewer_focused()
+                        && self.viewer.as_ref().is_some_and(|v| v.search.is_some()))
+            }
+            _ => false,
+        }
+    }
+
     /// Клавиши файловой панели.
-    fn on_files_key(&mut self, code: KeyCode) {
+    fn on_files_key(&mut self, key: KeyEvent) {
         let show_hidden = self.cfg.show_hidden;
-        match code {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            // Shift+←→ при нескольких колонках — соседняя колонка, та же строка.
+            KeyCode::Left | KeyCode::Right if shift => {
+                let panel = self.active_panel();
+                if panel.columns > 1 {
+                    let step = panel.rows as isize;
+                    panel.move_by(if key.code == KeyCode::Left {
+                        -step
+                    } else {
+                        step
+                    });
+                }
+            }
             KeyCode::Up => self.active_panel().move_by(-1),
             KeyCode::Down => self.active_panel().move_by(1),
             KeyCode::PageUp => {
@@ -537,8 +576,7 @@ impl App {
                 viewer.start_search();
             }
             KeyCode::Tab => self.active = self.active.other(),
-            KeyCode::Esc | KeyCode::Char('p') => self.close_viewer(),
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('p' | 'q') => self.close_viewer(),
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             _ => {}
         }
@@ -746,11 +784,11 @@ impl App {
                 KeyCode::Char('s') => Choice::Skip,
                 KeyCode::Char('R') => Choice::ReplaceAll,
                 KeyCode::Char('S') => Choice::SkipAll,
-                KeyCode::Esc => Choice::Cancel,
+                KeyCode::Esc | KeyCode::Char('q') => Choice::Cancel,
                 _ => return,
             };
             job.answer(choice);
-        } else if code == KeyCode::Esc {
+        } else if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
             job.cancel();
         }
     }
@@ -849,9 +887,8 @@ impl App {
             KeyCode::Left => {
                 large.leave();
             }
-            KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 let Some(large) = self.large.take() else {
                     return;
                 };
@@ -938,7 +975,7 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 let Mode::Settings(form) = std::mem::replace(&mut self.mode, Mode::Normal) else {
                     return;
                 };
@@ -1134,15 +1171,25 @@ fn spawn_events() -> Receiver<Event> {
 ///
 /// `cfg_ok` — конфиг прочитан без ошибок. Если нет, файл не перезаписывается:
 /// иначе одна опечатка стоила бы пользователю всех его настроек.
-pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<()> {
+/// Возвращает директорию активной панели на момент выхода.
+pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<PathBuf> {
     let mut app = App::new(left, right, cfg);
     app.save_config = cfg_ok;
     let mut terminal = ratatui::init();
+    // Паники загрузчика перехватываются в нём самом; обработчик ratatui при этом
+    // восстановил бы терминал и сломал экран работающей программы.
+    let restore_terminal = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() != Some(crate::preview::LOADER_THREAD) {
+            restore_terminal(info);
+        }
+    }));
     let result = main_loop(&mut terminal, &mut app);
     ratatui::restore();
     // Распакованные архивы живут только пока работает программа.
     let _ = std::fs::remove_dir_all(mount_base());
     result?;
+    let last = app.panel(app.active).exit_dir();
 
     if app.save_config {
         app.store_session();
@@ -1150,7 +1197,7 @@ pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<(
             eprintln!("{}: {err:#}", app.text().config_not_saved);
         }
     }
-    Ok(())
+    Ok(last)
 }
 
 /// Итог операции одной строкой: «скопировано: 3, пропущено: 1, ошибок: 2 — …».
@@ -2003,5 +2050,89 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('?'));
         assert!(matches!(app.mode, Mode::Help { .. }));
+    }
+
+    #[test]
+    fn shift_arrows_move_between_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..25 {
+            std::fs::write(tmp.path().join(format!("f{i:02}")), "").unwrap();
+        }
+        let mut app = app_in(tmp.path());
+        let shift = |app: &mut App, code| app.on_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+
+        // Одна колонка: Shift+стрелки ничего не делают — ни курсор, ни директория.
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.panel(Side::Left).cursor, 0);
+        assert_eq!(app.panel(Side::Left).dir, tmp.path());
+
+        press(&mut app, KeyCode::Char('3'));
+        app.panel_mut(Side::Left).rows = 10; // высоту задаёт отрисовка
+        press(&mut app, KeyCode::Down);
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.panel(Side::Left).cursor, 11);
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.panel(Side::Left).cursor, 21);
+        // Дальше колонки нет — курсор упирается в последний элемент.
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.panel(Side::Left).cursor, 24);
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(app.panel(Side::Left).cursor, 14);
+        shift(&mut app, KeyCode::Left);
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(app.panel(Side::Left).cursor, 0);
+        assert_eq!(app.panel(Side::Left).dir, tmp.path());
+    }
+
+    #[test]
+    fn q_acts_like_esc_outside_the_file_list() {
+        let (_tmp, mut app) = viewer_dir();
+        // Просмотр: q закрывает его, а не программу.
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.viewer.is_none());
+        assert!(!app.quit);
+
+        // Диалог удаления: q — отмена.
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.quit);
+
+        // Режим «большие объекты»: q — назад в панели.
+        press(&mut app, KeyCode::Char('l'));
+        wait_large(&mut app);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.large.is_none());
+        assert!(!app.quit);
+
+        // В строке поиска q — просто буква.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.finder.as_ref().unwrap().query, "q");
+        press(&mut app, KeyCode::Esc);
+
+        // В списке файлов q — выход.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn foreign_layout_is_reported_not_ignored() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Down);
+        // «с» — это `c` в русской раскладке.
+        press(&mut app, KeyCode::Char('с'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!tmp.path().join("right/a").exists());
+        let status = app.status.as_ref().unwrap();
+        assert!(status.error);
+        assert!(status.text.contains("keyboard layout"), "{}", status.text);
+
+        // Там, где вводится текст, кириллица — обычный ввод.
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('с'));
+        assert_eq!(app.finder.as_ref().unwrap().query, "с");
     }
 }

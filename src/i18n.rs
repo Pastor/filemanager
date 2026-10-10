@@ -236,6 +236,10 @@ pub struct Text {
     pub on: &'static str,
     pub off: &'static str,
     pub settings_saved: &'static str,
+    pub help_columns_move: &'static str,
+    pub wrong_layout: &'static str,
+    pub hint_show: &'static str,
+    pub help_q: &'static str,
 }
 
 pub static EN: Text = Text {
@@ -420,6 +424,10 @@ pub static EN: Text = Text {
     on: "on",
     off: "off",
     settings_saved: "settings saved",
+    help_columns_move: "previous / next column (with several columns)",
+    wrong_layout: "this command is not available in the current keyboard layout — switch to English",
+    hint_show: "show panel",
+    help_q: "quit; in dialogs, preview and modes — same as Esc",
 };
 
 pub static RU: Text = Text {
@@ -604,4 +612,8 @@ pub static RU: Text = Text {
     on: "вкл",
     off: "выкл",
     settings_saved: "настройки сохранены",
+    help_columns_move: "предыдущая / следующая колонка (если колонок несколько)",
+    wrong_layout: "команда недоступна в текущей раскладке — переключитесь на английскую",
+    hint_show: "показать панель",
+    help_q: "выход; в диалогах, просмотре и режимах — как Esc",
 };

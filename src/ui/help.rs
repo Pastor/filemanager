@@ -20,6 +20,7 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
                 ("<  >", t.hint_width),
                 ("P", t.hint_hide),
                 ("1 2 3", t.hint_columns),
+                ("Shift+←→", t.help_columns_move),
                 (".", t.hint_hidden),
             ],
         ),
@@ -80,7 +81,7 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
             vec![
                 ("?", t.hint_help),
                 ("o", t.hint_settings),
-                ("q", t.hint_quit),
+                ("q", t.help_q),
                 ("Ctrl+C", t.help_ctrl_c),
             ],
         ),
