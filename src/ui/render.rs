@@ -58,6 +58,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Job(job) => draw_job(frame, main, job, &app.theme, app.text()),
         Mode::EditorSave | Mode::EditorExit => draw_save(frame, main, app),
         Mode::Pack(form) => draw_pack(frame, main, form, &app.theme, app.text()),
+        Mode::Help { scroll } => draw_help(frame, area, *scroll, &app.theme, app.text()),
+        Mode::Settings(form) => draw_settings(frame, main, form.field, app),
     }
 }
 
@@ -413,6 +415,8 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Mode::EditorSave => vec![("y", t.save), ("Esc", t.cancel)],
         Mode::EditorExit => vec![("y", t.save), ("n", t.discard), ("Esc", t.keep_editing)],
         Mode::Pack(_) => pack_hints(t),
+        Mode::Help { .. } => vec![("↑↓", t.hint_scroll), ("Esc", t.hint_close)],
+        Mode::Settings(_) => settings_hints(t),
         Mode::Normal if app.viewer_focused() => {
             let wrap = app.viewer.as_ref().is_some_and(|v| v.wrap);
             let mut hints = vec![("↑↓", t.hint_scroll)];
@@ -429,6 +433,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints
         }
         Mode::Normal => vec![
+            ("?", t.hint_help),
             ("↑↓", t.hint_move),
             ("→←", t.hint_in_out),
             ("Tab", t.hint_panel),
@@ -441,6 +446,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("d", t.hint_delete),
             ("a", t.hint_pack),
             ("l", t.hint_large),
+            ("o", t.hint_settings),
             ("P", t.hint_hide),
             ("<>", t.hint_width),
             ("1-3", t.hint_columns),
@@ -462,6 +468,104 @@ fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
         vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
         vec![("R", t.replace_all), ("S", t.skip_all)],
     ]
+}
+
+/// Справка по всем клавишам поверх экрана, с прокруткой.
+fn draw_help(frame: &mut Frame, area: Rect, scroll: usize, theme: &Theme, t: &'static Text) {
+    let sections = crate::ui::help::sections(t);
+    let key_width = sections
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|(k, _)| k.width()))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let mut lines = Vec::new();
+    for (title, items) in &sections {
+        lines.push(Line::styled(title.to_string(), theme.title(true)));
+        for (key, desc) in items {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<key_width$}"), theme.key()),
+                Span::raw(desc.to_string()),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+    // Оставляем по краям место, чтобы было видно, что это окно поверх панелей.
+    let width = area.width.saturating_sub(4).min(90);
+    let height = area.height.saturating_sub(2);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border(true))
+        .title(Line::styled(
+            format!(" {} ", t.help_title),
+            theme.title(true),
+        ))
+        .title_bottom(
+            Line::styled(
+                format!(" {}/{} ", (scroll + 1).min(lines.len()), lines.len()),
+                theme.dim(),
+            )
+            .right_aligned(),
+        )
+        .padding(Padding::horizontal(1))
+        .style(theme.base());
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((scroll as u16, 0)),
+        rect,
+    );
+}
+
+/// Клавиши окна настроек.
+fn settings_hints(t: &'static Text) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("↑↓", t.hint_move),
+        ("←→", t.hint_change),
+        ("Enter", t.save),
+        ("Esc", t.cancel),
+    ]
+}
+
+/// Окно настроек: поле слева, значение справа, выбранное поле подсвечено.
+fn draw_settings(frame: &mut Frame, area: Rect, selected: usize, app: &App) {
+    let theme = app.theme;
+    let t = app.text();
+    let fields = crate::ui::help::Field::ALL;
+    let label_width = fields.iter().map(|f| f.label(t).width()).max().unwrap_or(0) + 3;
+    let value_width = 14;
+    let body: Vec<Line> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let value = format!("‹ {} ›", field.value(&app.cfg, t));
+            let line = Line::from(vec![
+                Span::raw(format!("{:<label_width$}", field.label(t))),
+                Span::styled(format!("{value:^value_width$}"), theme.key()),
+            ]);
+            if i == selected {
+                line.patch_style(theme.cursor(true))
+            } else {
+                line
+            }
+        })
+        .collect();
+    // Клавиши окна — в строке подсказок внизу экрана.
+    dialog(
+        frame,
+        area,
+        t.settings_title,
+        body,
+        theme.border(true),
+        &theme,
+    );
 }
 
 /// Ширина полосы доли в режиме «большие объекты».
@@ -1972,5 +2076,31 @@ mod tests {
         assert!(lines[2].contains("small"));
         assert!(lines[6].contains("3.9 K · 3 objects"), "{}", lines[6]);
         assert!(lines[7].contains("Esc exit"));
+    }
+
+    #[test]
+    fn frame_help_and_settings() {
+        let tmp = sample_dir();
+        let mut app = App::new_for_test(tmp.path());
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        let lines = screen(&mut app, 100, 30);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains(" Help "));
+        assert!(all.contains("Panels"));
+        assert!(all.contains("Ctrl+C") || all.contains("Space"), "{all}");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('o')));
+        app.on_key(KeyEvent::from(KeyCode::Right)); // язык → русский
+        let lines = screen(&mut app, 100, 20);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("Настройки"), "{all}");
+        assert!(all.contains("‹ Русский ›"));
+        assert!(all.contains("‹ Dark ›"));
+        // Подсказки тоже на русском, без перезапуска.
+        assert!(lines[19].contains("изменить"));
     }
 }

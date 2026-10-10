@@ -1,6 +1,7 @@
 //! Состояние приложения, цикл событий и обработка клавиш.
 
 mod finder;
+mod help;
 mod job;
 mod large;
 mod render;
@@ -22,6 +23,7 @@ use crate::panel::{Panel, in_archive, mount_base};
 use crate::preview::{Body, Loader, Preview};
 use crate::search::Kind as SearchKind;
 use crate::ui::finder::Finder;
+use crate::ui::help::{Field, SettingsForm};
 use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::large::Large;
 use crate::ui::theme::Theme;
@@ -51,6 +53,10 @@ pub enum Mode {
     EditorExit,
     /// Создание архива: выбор формата и имени.
     Pack(PackForm),
+    /// Справка; `scroll` — первая видимая строка.
+    Help { scroll: usize },
+    /// Окно настроек.
+    Settings(SettingsForm),
 }
 
 /// Форма создания архива.
@@ -87,6 +93,9 @@ pub struct App {
     pub theme: Theme,
     pub status: Option<Status>,
     pub mode: Mode,
+    /// Сохранять конфиг при выходе: `false`, если файл был испорчен и
+    /// пользователь ещё не сохранил настройки явно.
+    pub save_config: bool,
     /// Панель просмотра, если открыта. Она занимает место одной из панелей.
     pub viewer: Option<Viewer>,
     /// Редактор на месте просмотра, если открыт.
@@ -126,6 +135,7 @@ impl App {
             theme,
             status,
             mode: Mode::Normal,
+            save_config: true,
             viewer: None,
             editor: None,
             finder: None,
@@ -199,6 +209,8 @@ impl App {
             Mode::EditorSave => return self.on_save_key(key.code),
             Mode::EditorExit => return self.on_exit_key(key.code),
             Mode::Pack(_) => return self.on_pack_key(key.code),
+            Mode::Help { .. } => return self.on_help_key(key.code),
+            Mode::Settings(_) => return self.on_settings_key(key.code),
         }
         // Редактор сам разбирает сочетания с Ctrl.
         if self.editor.is_some() {
@@ -324,6 +336,8 @@ impl App {
                 self.large = Some(Large::start(root));
             }
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
+            KeyCode::Char('o') => self.open_settings(),
             _ => {}
         }
     }
@@ -525,6 +539,7 @@ impl App {
             KeyCode::Tab => self.active = self.active.other(),
             KeyCode::Esc | KeyCode::Char('p') => self.close_viewer(),
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             _ => {}
         }
     }
@@ -835,6 +850,7 @@ impl App {
                 large.leave();
             }
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Esc => {
                 let Some(large) = self.large.take() else {
                     return;
@@ -857,6 +873,98 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Клавиши справки: прокрутка и закрытие.
+    fn on_help_key(&mut self, code: KeyCode) {
+        let Mode::Help { scroll } = &mut self.mode else {
+            return;
+        };
+        let max = help::line_count(self.cfg.lang.text()).saturating_sub(1);
+        match code {
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down => *scroll = (*scroll + 1).min(max),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::PageDown => *scroll = (*scroll + 10).min(max),
+            KeyCode::Home => *scroll = 0,
+            KeyCode::End => *scroll = max,
+            KeyCode::Esc | KeyCode::Char('?' | 'q') => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// Открывает окно настроек.
+    fn open_settings(&mut self) {
+        self.mode = Mode::Settings(SettingsForm {
+            field: 0,
+            original: self.cfg.clone(),
+        });
+    }
+
+    /// Клавиши настроек: ↑↓ — поле, ←→ и пробел — значение (применяется
+    /// сразу), Enter — сохранить, Esc — вернуть как было.
+    fn on_settings_key(&mut self, code: KeyCode) {
+        let Mode::Settings(form) = &mut self.mode else {
+            return;
+        };
+        let n = Field::ALL.len();
+        let field = Field::ALL[form.field];
+        let step = match code {
+            KeyCode::Up => {
+                form.field = (form.field + n - 1) % n;
+                return;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                form.field = (form.field + 1) % n;
+                return;
+            }
+            KeyCode::Left => -1,
+            KeyCode::Right | KeyCode::Char(' ') => 1,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.store_session();
+                match self.cfg.save() {
+                    Ok(path) => {
+                        // Явное сохранение — согласие перезаписать и испорченный файл.
+                        self.save_config = true;
+                        let text = format!("{}: {}", self.text().settings_saved, path.display());
+                        self.info(text);
+                    }
+                    Err(err) => {
+                        let text = format!("{}: {err:#}", self.text().config_not_saved);
+                        self.fail(text);
+                    }
+                }
+                return;
+            }
+            KeyCode::Esc => {
+                let Mode::Settings(form) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                    return;
+                };
+                let before = std::mem::replace(&mut self.cfg, form.original);
+                self.apply_settings(&before);
+                return;
+            }
+            _ => return,
+        };
+        let before = self.cfg.clone();
+        field.change(&mut self.cfg, step);
+        self.apply_settings(&before);
+    }
+
+    /// Применяет изменившиеся настройки к тому, что уже на экране.
+    fn apply_settings(&mut self, before: &Config) {
+        if before.theme != self.cfg.theme {
+            self.theme = Theme::detect(self.cfg.theme);
+        }
+        if before.wrap != self.cfg.wrap
+            && let Some(viewer) = &mut self.viewer
+        {
+            viewer.wrap = self.cfg.wrap;
+        }
+        if before.show_hidden != self.cfg.show_hidden {
+            self.refresh_panels();
         }
     }
 
@@ -993,6 +1101,21 @@ impl App {
     }
 }
 
+impl Drop for App {
+    /// Панели удаляют свои распакованные архивы сами; общая папка процесса
+    /// удаляется, только если опустела — её может делить другой экземпляр
+    /// приложения в том же процессе (так бывает в тестах).
+    fn drop(&mut self) {
+        for panel in &mut self.panels {
+            panel.mounts.iter().for_each(|m| {
+                let _ = std::fs::remove_dir_all(&m.root);
+            });
+            panel.mounts.clear();
+        }
+        let _ = std::fs::remove_dir(mount_base());
+    }
+}
+
 /// Поток чтения событий терминала: главный цикл ждёт сразу несколько
 /// источников (позже — фоновые операции), поэтому события идут через канал.
 fn spawn_events() -> Receiver<Event> {
@@ -1013,6 +1136,7 @@ fn spawn_events() -> Receiver<Event> {
 /// иначе одна опечатка стоила бы пользователю всех его настроек.
 pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<()> {
     let mut app = App::new(left, right, cfg);
+    app.save_config = cfg_ok;
     let mut terminal = ratatui::init();
     let result = main_loop(&mut terminal, &mut app);
     ratatui::restore();
@@ -1020,7 +1144,7 @@ pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<(
     let _ = std::fs::remove_dir_all(mount_base());
     result?;
 
-    if cfg_ok {
+    if app.save_config {
         app.store_session();
         if let Err(err) = app.cfg.save() {
             eprintln!("{}: {err:#}", app.text().config_not_saved);
@@ -1839,5 +1963,45 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.large.is_none());
         assert_eq!(app.panel(Side::Left).dir, tmp.path());
+    }
+
+    #[test]
+    fn settings_apply_live_and_esc_reverts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".dot"), "").unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Down); // тема
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.theme.name, crate::ui::theme::ThemeName::Light);
+        press(&mut app, KeyCode::Down); // скрытые
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.panel(Side::Left).entries.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.cfg.theme, crate::ui::theme::ThemeName::Dark);
+        assert_eq!(app.theme.name, crate::ui::theme::ThemeName::Dark);
+        assert_eq!(app.panel(Side::Left).entries.len(), 1);
+    }
+
+    #[test]
+    fn help_scrolls_and_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::End);
+        let Mode::Help { scroll } = app.mode else {
+            panic!("ожидалась справка");
+        };
+        assert_eq!(scroll, help::line_count(app.text()) - 1);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(matches!(app.mode, Mode::Normal));
+        // Справка доступна и из просмотра.
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(matches!(app.mode, Mode::Help { .. }));
     }
 }

@@ -216,6 +216,26 @@ const NORD: Palette = Palette {
 };
 
 impl ThemeName {
+    /// Все схемы — для окна настроек.
+    pub const ALL: [ThemeName; 5] = [
+        ThemeName::Dark,
+        ThemeName::Light,
+        ThemeName::Gruvbox,
+        ThemeName::Solarized,
+        ThemeName::Nord,
+    ];
+
+    /// Название для показа.
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemeName::Dark => "Dark",
+            ThemeName::Light => "Light",
+            ThemeName::Gruvbox => "Gruvbox",
+            ThemeName::Solarized => "Solarized",
+            ThemeName::Nord => "Nord",
+        }
+    }
+
     fn palette(self) -> &'static Palette {
         match self {
             ThemeName::Dark => &DARK,
