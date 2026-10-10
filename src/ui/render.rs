@@ -35,6 +35,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main, hints] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     match app.hidden {
+        _ if app.large.is_some() => draw_large(frame, main, app),
         Some(hidden) => draw_side(frame, main, app, hidden.other()),
         None => {
             let [left, right] = Layout::horizontal([
@@ -370,6 +371,18 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let width = (area.width as usize).saturating_sub(1);
+    if app.large.is_some() {
+        let t = app.text();
+        let hints = [
+            ("↑↓", t.hint_move),
+            ("→←", t.hint_in_out),
+            ("Esc", t.hint_exit),
+            ("q", t.hint_quit),
+        ];
+        let line = hint_line(&hints, width, &theme);
+        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
+        return;
+    }
     if let Some(finder) = &app.finder {
         let line = finder_line(finder, width, &theme, app.text());
         frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
@@ -427,6 +440,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("m", t.hint_move_to),
             ("d", t.hint_delete),
             ("a", t.hint_pack),
+            ("l", t.hint_large),
             ("P", t.hint_hide),
             ("<>", t.hint_width),
             ("1-3", t.hint_columns),
@@ -448,6 +462,120 @@ fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
         vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
         vec![("R", t.replace_all), ("S", t.skip_all)],
     ]
+}
+
+/// Ширина полосы доли в режиме «большие объекты».
+const LARGE_BAR: usize = 12;
+
+/// Режим «большие объекты» на весь экран: размер, полоса доли, процент, имя.
+fn draw_large(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
+    let t = app.text();
+    let shown = match &app.large {
+        Some(large) => app.panels[app.active as usize].display_path(&large.current_path()),
+        None => return,
+    };
+    let Some(large) = app.large.as_mut() else {
+        return;
+    };
+    let title = format!(
+        " {}: {} ",
+        t.large_title,
+        shorten_path(
+            &display_path(&shown),
+            (area.width as usize).saturating_sub(t.large_title.width() + 6)
+        )
+    );
+    let summary = match large.current() {
+        Some(node) => format!(
+            " {} · {} {} ",
+            format_size(node.size),
+            crate::ui::theme::format_count(node.items),
+            t.objects
+        ),
+        None => {
+            let (files, dirs, bytes) = large.progress.snapshot();
+            format!(
+                " {} {files} {} · {dirs} {} · {} · {:.1}s ",
+                t.scanning,
+                t.info_files,
+                t.dirs_scanned,
+                format_size(bytes),
+                large.started.elapsed().as_secs_f32()
+            )
+        }
+    };
+    let counter = if large.order.is_empty() {
+        String::new()
+    } else {
+        format!(" {}/{} ", large.cursor + 1, large.order.len())
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border(true))
+        .title(Line::styled(title, theme.title(true)))
+        .title_bottom(Line::styled(summary, theme.dim()).left_aligned())
+        .title_bottom(Line::styled(counter, theme.dim()).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    large.fit(rows);
+    let Some(node) = large.current() else {
+        return;
+    };
+    // Шкала цвета — относительно крупнейшего на этом уровне, доля — от целого.
+    let max = large
+        .order
+        .first()
+        .map(|&i| node.children[i].size)
+        .unwrap_or(0);
+    let total = node.size.max(1);
+    let lines: Vec<Line> = large
+        .order
+        .iter()
+        .enumerate()
+        .skip(large.offset)
+        .take(rows)
+        .map(|(row, &i)| {
+            let child = &node.children[i];
+            let heat = theme.heat(crate::ui::theme::heat_t(child.size, max));
+            let share = child.size as f64 / total as f64;
+            let filled = ((share * LARGE_BAR as f64).round() as usize)
+                .clamp(usize::from(child.size > 0), LARGE_BAR);
+            let (style, suffix) = match child.kind {
+                crate::scan::Kind::Dir => (theme.dir(), "/"),
+                crate::scan::Kind::Symlink => (theme.link(), ""),
+                _ => (Style::default(), ""),
+            };
+            let mut name = format!("{}{suffix}", child.display_name());
+            if child.denied {
+                name.push_str(&format!("  ({})", t.denied));
+            }
+            let head = format!(" {:>9}  ", format_size(child.size));
+            let tail = format!(" {:>5.1}%  ", share * 100.0);
+            let room = width.saturating_sub(head.width() + LARGE_BAR + tail.width());
+            let name = fit(&name, "", room);
+            let pad = room.saturating_sub(name.width());
+            let line = Line::from(vec![
+                Span::styled(head, heat),
+                Span::styled("█".repeat(filled), heat),
+                Span::styled("░".repeat(LARGE_BAR - filled), theme.dim()),
+                Span::styled(tail, theme.dim()),
+                Span::styled(name, style),
+                Span::raw(" ".repeat(pad)),
+            ]);
+            if row == large.cursor {
+                line.patch_style(theme.cursor(true))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Строка запроса поиска в панели: вид поиска, запрос, клавиши.
@@ -1821,5 +1949,28 @@ mod tests {
         let all = lines.join("\n");
         assert!(all.contains("proj/a.txt"), "{all}");
         assert!(all.contains("archive · 2 entries"), "{all}");
+    }
+
+    #[test]
+    fn frame_large_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("big")).unwrap();
+        std::fs::write(tmp.path().join("big/blob"), vec![0u8; 3000]).unwrap();
+        std::fs::write(tmp.path().join("small"), vec![0u8; 1000]).unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        crate::ui::tests::wait_large(&mut app);
+        let lines = screen(&mut app, 80, 8);
+        println!("{}", lines.join("\n"));
+        assert!(lines[0].contains("largest objects"));
+        assert!(
+            lines[1].contains("2.9 K") && lines[1].contains("75.0%") && lines[1].contains("big/"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].contains("small"));
+        assert!(lines[6].contains("3.9 K · 3 objects"), "{}", lines[6]);
+        assert!(lines[7].contains("Esc exit"));
     }
 }

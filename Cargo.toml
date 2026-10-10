@@ -8,6 +8,8 @@ authors = ["Pastor <viruszold@gmail.com>"]
 [dependencies]
 ratatui = "0.30"
 crossbeam-channel = "0.5"
+rayon = "1.12"
+parking_lot = "0.12"
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"

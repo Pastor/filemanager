@@ -175,6 +175,14 @@ pub struct Text {
     pub archive: &'static str,
     pub entries: &'static str,
     pub archive_readonly: &'static str,
+
+    // Режим «большие объекты».
+    pub hint_large: &'static str,
+    pub large_title: &'static str,
+    pub scanning: &'static str,
+    pub dirs_scanned: &'static str,
+    pub objects: &'static str,
+    pub denied: &'static str,
 }
 
 pub static EN: Text = Text {
@@ -311,6 +319,13 @@ pub static EN: Text = Text {
     archive: "archive",
     entries: "entries",
     archive_readonly: "archives are read-only: changes are not packed back",
+
+    hint_large: "largest",
+    large_title: "largest objects",
+    scanning: "scanning…",
+    dirs_scanned: "dirs",
+    objects: "objects",
+    denied: "no access",
 };
 
 pub static RU: Text = Text {
@@ -447,4 +462,11 @@ pub static RU: Text = Text {
     archive: "архив",
     entries: "элементов",
     archive_readonly: "архивы только для чтения: изменения в архив не попадут",
+
+    hint_large: "крупные",
+    large_title: "большие объекты",
+    scanning: "сканирование…",
+    dirs_scanned: "дир.",
+    objects: "объектов",
+    denied: "нет доступа",
 };

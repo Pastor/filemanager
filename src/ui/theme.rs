@@ -394,6 +394,67 @@ impl Theme {
     }
 }
 
+/// Опорные точки шкалы размера: от светло-зелёного (мало) к буро-красному
+/// (много) — как во `flob`.
+const HEAT: [(f32, Rgb); 5] = [
+    (0.00, (0xA8, 0xE6, 0xA0)),
+    (0.35, (0xD9, 0xE0, 0x6B)),
+    (0.60, (0xE8, 0xA3, 0x3D)),
+    (0.80, (0xD9, 0x54, 0x2B)),
+    (1.00, (0x8C, 0x2F, 0x14)),
+];
+
+/// Сколько порядков величины укладывается в шкалу: объект в `10^4` раз меньше
+/// максимального уже полностью «холодный».
+const DYNAMIC_RANGE: f64 = 1e4;
+
+/// Нормированное «тепло» объекта: логарифм отношения к максимуму. Линейная
+/// шкала окрасила бы почти всё в зелёный — размеры распределены очень неравно.
+pub fn heat_t(size: u64, max: u64) -> f32 {
+    if max == 0 || size == 0 {
+        return 0.0;
+    }
+    let ratio = max as f64 / size as f64;
+    (1.0 - ratio.ln() / DYNAMIC_RANGE.ln()).clamp(0.0, 1.0) as f32
+}
+
+fn heat_rgb(t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8, k: f32| (a as f32 + (b as f32 - a as f32) * k).round() as u8;
+    for pair in HEAT.windows(2) {
+        let ((t0, c0), (t1, c1)) = (pair[0], pair[1]);
+        if t <= t1 {
+            let k = (t - t0) / (t1 - t0);
+            return (
+                lerp(c0.0, c1.0, k),
+                lerp(c0.1, c1.1, k),
+                lerp(c0.2, c1.2, k),
+            );
+        }
+    }
+    HEAT[HEAT.len() - 1].1
+}
+
+/// Число с разделителями разрядов: `1 234 567`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+impl Theme {
+    /// Цвет «тепла» `t` из `[0, 1]`.
+    pub fn heat(&self, t: f32) -> Style {
+        Style::default().fg(self.rgb(heat_rgb(t)))
+    }
+}
+
 /// Читает `COLORTERM`/`TERM` и выбирает глубину цвета.
 fn detect_depth() -> ColorDepth {
     let colorterm = std::env::var("COLORTERM")
@@ -535,5 +596,23 @@ mod tests {
         }
         let w: W = toml::from_str("t = \"solarized\"").unwrap();
         assert_eq!(w.t, ThemeName::Solarized);
+    }
+
+    #[test]
+    fn format_count_groups_digits() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(1234), "1 234");
+        assert_eq!(format_count(1_234_567), "1 234 567");
+    }
+
+    #[test]
+    fn heat_scale_is_logarithmic() {
+        let max = 160 * 1024 * 1024;
+        assert!((heat_t(max, max) - 1.0).abs() < 1e-6);
+        assert!((heat_t(max / 100, max) - 0.5).abs() < 0.02);
+        assert_eq!(heat_t(max / 100_000, max), 0.0);
+        assert_eq!(heat_t(0, max), 0.0);
+        assert_eq!(heat_rgb(0.0), HEAT[0].1);
+        assert_eq!(heat_rgb(1.0), HEAT[4].1);
     }
 }

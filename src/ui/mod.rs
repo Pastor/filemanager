@@ -2,6 +2,7 @@
 
 mod finder;
 mod job;
+mod large;
 mod render;
 pub mod theme;
 mod viewer;
@@ -9,7 +10,7 @@ mod viewer;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, never, select, unbounded};
+use crossbeam_channel::{Receiver, Sender, never, select, tick, unbounded};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::archive::Format;
@@ -22,6 +23,7 @@ use crate::preview::{Body, Loader, Preview};
 use crate::search::Kind as SearchKind;
 use crate::ui::finder::Finder;
 use crate::ui::job::{Job, JobKind, JobMsg};
+use crate::ui::large::Large;
 use crate::ui::theme::Theme;
 use crate::ui::viewer::{HSCROLL_STEP, Viewer};
 
@@ -91,6 +93,8 @@ pub struct App {
     pub editor: Option<Editor>,
     /// Поиск в панели, если открыт.
     pub finder: Option<Finder>,
+    /// Режим «большие объекты», если открыт.
+    pub large: Option<Large>,
     loader: Loader,
     pub quit: bool,
 }
@@ -125,6 +129,7 @@ impl App {
             viewer: None,
             editor: None,
             finder: None,
+            large: None,
             loader: Loader::new(),
             quit: false,
         }
@@ -209,7 +214,9 @@ impl App {
         }
         self.status = None;
 
-        if self.finder.is_some() {
+        if self.large.is_some() {
+            self.on_large_key(key.code);
+        } else if self.finder.is_some() {
             self.on_finder_key(key.code);
         } else if self.viewer_focused() {
             self.on_viewer_key(key.code);
@@ -312,6 +319,10 @@ impl App {
             KeyCode::Char('d') => self.ask_delete(!self.cfg.use_trash),
             KeyCode::Char('D') => self.ask_delete(true),
             KeyCode::Char('a') => self.ask_pack(),
+            KeyCode::Char('l') => {
+                let root = self.panel(self.active).dir.clone();
+                self.large = Some(Large::start(root));
+            }
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -804,6 +815,51 @@ impl App {
         }
     }
 
+    /// Клавиши режима «большие объекты». Esc возвращает в панели и открывает
+    /// в активной ту директорию, где был курсор.
+    fn on_large_key(&mut self, code: KeyCode) {
+        let Some(large) = &mut self.large else {
+            return;
+        };
+        match code {
+            KeyCode::Up => large.move_by(-1),
+            KeyCode::Down => large.move_by(1),
+            KeyCode::PageUp => large.move_by(-(large.rows as isize)),
+            KeyCode::PageDown => large.move_by(large.rows as isize),
+            KeyCode::Home => large.home(),
+            KeyCode::End => large.end(),
+            KeyCode::Right | KeyCode::Enter => {
+                large.enter();
+            }
+            KeyCode::Left => {
+                large.leave();
+            }
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc => {
+                let Some(large) = self.large.take() else {
+                    return;
+                };
+                // Сканирование не закончилось — переходить некуда.
+                if large.tree.is_none() {
+                    return;
+                }
+                let dir = large.current_path();
+                let name = large.selected().map(|n| n.display_name().into_owned());
+                if dir != self.panel(self.active).dir {
+                    let show = self.cfg.show_hidden;
+                    if let Err(err) = self.active_panel().cd(dir.clone(), show) {
+                        self.fail_open(dir, err);
+                        return;
+                    }
+                }
+                if let Some(name) = name {
+                    self.active_panel().select_name(&name);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Открывает форму создания архива для выделенного или элемента под курсором.
     fn ask_pack(&mut self) {
         let panel = self.panel(self.active);
@@ -1023,7 +1079,21 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
             .as_ref()
             .and_then(Finder::rx)
             .unwrap_or_else(never);
+        let scanned = app.large.as_ref().and_then(Large::rx).unwrap_or_else(never);
+        // Пока идёт сканирование, счётчики на экране обновляются по таймеру.
+        let ticks = if app.large.as_ref().is_some_and(|l| l.tree.is_none()) {
+            tick(std::time::Duration::from_millis(100))
+        } else {
+            never()
+        };
         select! {
+            recv(scanned) -> tree => {
+                if let (Ok(tree), Some(large)) = (tree, app.large.as_mut()) {
+                    large.scanned(tree);
+                }
+                dirty = true;
+            }
+            recv(ticks) -> _ => dirty = true,
             recv(found) -> msg => {
                 if let Ok(msg) = msg {
                     app.on_finder_msg(msg);
@@ -1724,5 +1794,50 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Normal));
         assert!(!tmp.path().join("left/dir.zip").exists());
+    }
+
+    /// Дожидается окончания сканирования в режиме «большие объекты».
+    pub(super) fn wait_large(app: &mut App) {
+        let rx = app
+            .large
+            .as_ref()
+            .and_then(Large::rx)
+            .expect("режим открыт");
+        let tree = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("сканирование должно закончиться");
+        app.large.as_mut().unwrap().scanned(tree);
+    }
+
+    #[test]
+    fn large_mode_esc_opens_directory_in_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("big/deeper")).unwrap();
+        std::fs::write(tmp.path().join("big/deeper/blob"), vec![0u8; 5000]).unwrap();
+        std::fs::write(tmp.path().join("big/note"), "x").unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('l'));
+        wait_large(&mut app);
+        press(&mut app, KeyCode::Enter); // big
+        press(&mut app, KeyCode::Down); // note
+        press(&mut app, KeyCode::Esc);
+        assert!(app.large.is_none());
+        let panel = app.panel(Side::Left);
+        assert_eq!(panel.dir, tmp.path().join("big"));
+        assert_eq!(panel.current().unwrap().name, "note");
+    }
+
+    #[test]
+    fn large_mode_esc_during_scan_just_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('l'));
+        // Клавиши режима не трогают панель, даже `d` и `c`.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::Normal));
+        app.large.as_mut().unwrap().tree = None;
+        press(&mut app, KeyCode::Esc);
+        assert!(app.large.is_none());
+        assert_eq!(app.panel(Side::Left).dir, tmp.path());
     }
 }

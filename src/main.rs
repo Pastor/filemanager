@@ -10,6 +10,7 @@ mod listing;
 mod ops;
 mod panel;
 mod preview;
+mod scan;
 mod search;
 mod ui;
 
