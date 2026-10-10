@@ -125,7 +125,7 @@ impl Editor {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let tmp = dir.join(format!(".{name}.fm-save"));
+        let tmp = dir.join(format!(".{name}.{}-save", crate::config::APP));
         let result = (|| {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(self.text().as_bytes())?;

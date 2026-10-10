@@ -1,6 +1,6 @@
 //! Конфигурация: настройки пользователя и состояние сессии в одном TOML-файле.
 //!
-//! Файл лежит в `~/.config/fm/config.toml` на всех платформах. `dirs::config_dir`
+//! Файл лежит в `~/.config/fmgr/config.toml` на всех платформах. `dirs::config_dir`
 //! на macOS указывает в `~/Library/Application Support`, где консольные утилиты
 //! никто не ищет, поэтому путь строится от домашней директории явно.
 
@@ -116,8 +116,14 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Путь к файлу конфигурации: `~/.config/fm/config.toml`.
+    /// Путь к файлу конфигурации: `~/.config/fmgr/config.toml`.
     pub fn path() -> Option<PathBuf> {
+        dirs::home_dir().map(|d| d.join(".config").join(APP).join("config.toml"))
+    }
+
+    /// Где лежал конфиг, пока программа называлась `fm`. Имя пришлось
+    /// сменить: в macOS 27 появилась системная `/usr/bin/fm`.
+    fn legacy_path() -> Option<PathBuf> {
         dirs::home_dir().map(|d| d.join(".config").join("fm").join("config.toml"))
     }
 
@@ -126,6 +132,9 @@ impl Config {
         let Some(path) = Self::path() else {
             return Ok(Self::default());
         };
+        if let Some(legacy) = Self::legacy_path() {
+            migrate(&legacy, &path);
+        }
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -152,6 +161,22 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
         Ok(path)
+    }
+}
+
+/// Имя программы: команда запуска и папка настроек.
+pub const APP: &str = "fmgr";
+
+/// Переносит конфиг со старого места, если на новом его ещё нет. Старый файл
+/// не удаляется — копия безопаснее переноса, а мешать он не будет.
+fn migrate(legacy: &std::path::Path, path: &std::path::Path) {
+    if path.exists() || !legacy.is_file() {
+        return;
+    }
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        let _ = std::fs::copy(legacy, path);
     }
 }
 
@@ -212,6 +237,29 @@ mod tests {
         assert_eq!(cfg.session.left_pct, LEFT_PCT_MAX);
         assert_eq!(cfg.session.left_columns, 1);
         assert_eq!(cfg.session.right_columns, MAX_COLUMNS);
+    }
+
+    #[test]
+    fn legacy_config_is_copied_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("fm/config.toml");
+        let path = tmp.path().join("fmgr/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "lang = \"ru\"").unwrap();
+
+        migrate(&legacy, &path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "lang = \"ru\"");
+        assert!(legacy.exists());
+
+        // Новый конфиг уже есть — старый его не затирает.
+        std::fs::write(&path, "lang = \"en\"").unwrap();
+        migrate(&legacy, &path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "lang = \"en\"");
+
+        // Старого нет — ничего не происходит.
+        let fresh = tmp.path().join("other/config.toml");
+        migrate(&tmp.path().join("missing"), &fresh);
+        assert!(!fresh.exists());
     }
 
     #[test]

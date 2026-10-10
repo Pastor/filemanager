@@ -1,4 +1,4 @@
-//! fm — двухпанельный TUI-файловый менеджер.
+//! fmgr — двухпанельный TUI-файловый менеджер.
 
 mod archive;
 mod config;
@@ -25,7 +25,7 @@ use crate::ui::theme::ThemeName;
 
 /// Аргументы командной строки. Перекрывают значения из файла конфигурации.
 #[derive(Debug, Parser)]
-#[command(name = "fm", version, about = "Two-panel terminal file manager")]
+#[command(name = "fmgr", version, about = "Two-panel terminal file manager")]
 struct Args {
     /// Directories for the left and right panels (default: current directory).
     #[arg(num_args = 0..=2)]

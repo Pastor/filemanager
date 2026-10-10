@@ -50,7 +50,7 @@ pub struct Mount {
 
 /// Общая временная директория для распакованных архивов этого процесса.
 pub fn mount_base() -> PathBuf {
-    std::env::temp_dir().join(format!("fm-{}", std::process::id()))
+    std::env::temp_dir().join(format!("{}-{}", crate::config::APP, std::process::id()))
 }
 
 /// Путь лежит внутри распакованного архива: изменения там не попадут в архив.
