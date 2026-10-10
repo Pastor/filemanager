@@ -1,8 +1,10 @@
 //! fm — двухпанельный TUI-файловый менеджер.
 
 mod config;
+mod editor;
 mod highlight;
 mod i18n;
+mod indent;
 mod listing;
 mod ops;
 mod panel;

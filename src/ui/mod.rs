@@ -12,10 +12,11 @@ use crossbeam_channel::{Receiver, Sender, never, select, unbounded};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
+use crate::editor::{Editor, OpenError};
 use crate::i18n::Text;
 use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::Panel;
-use crate::preview::{Loader, Preview};
+use crate::preview::{Body, Loader, Preview};
 use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::theme::Theme;
 use crate::ui::viewer::{HSCROLL_STEP, Viewer};
@@ -38,6 +39,10 @@ pub enum Mode {
     },
     /// Выполняется файловая операция.
     Job(Job),
+    /// Подтверждение сохранения по Ctrl+S.
+    EditorSave,
+    /// Выход из редактора с несохранёнными изменениями.
+    EditorExit,
 }
 
 /// Состояние приложения.
@@ -56,6 +61,8 @@ pub struct App {
     pub mode: Mode,
     /// Панель просмотра, если открыта. Она занимает место одной из панелей.
     pub viewer: Option<Viewer>,
+    /// Редактор на месте просмотра, если открыт.
+    pub editor: Option<Editor>,
     loader: Loader,
     pub quit: bool,
 }
@@ -88,6 +95,7 @@ impl App {
             status,
             mode: Mode::Normal,
             viewer: None,
+            editor: None,
             loader: Loader::new(),
             quit: false,
         }
@@ -154,6 +162,13 @@ impl App {
             Mode::Normal => {}
             Mode::ConfirmDelete { .. } => return self.on_confirm_key(key.code),
             Mode::Job(_) => return self.on_job_key(key.code),
+            Mode::EditorSave => return self.on_save_key(key.code),
+            Mode::EditorExit => return self.on_exit_key(key.code),
+        }
+        // Редактор сам разбирает сочетания с Ctrl.
+        if self.editor.is_some() {
+            self.status = None;
+            return self.on_editor_key(key);
         }
         // Сочетания с Ctrl и Alt пока не используются; Shift входит в сам символ.
         if key
@@ -343,6 +358,7 @@ impl App {
             KeyCode::Left => viewer.hscroll(-(HSCROLL_STEP as isize)),
             KeyCode::Right => viewer.hscroll(HSCROLL_STEP as isize),
             KeyCode::Char('w') => viewer.toggle_wrap(),
+            KeyCode::Char('e') => self.start_editing(),
             KeyCode::Char('/') => {
                 viewer.start_search();
             }
@@ -350,6 +366,142 @@ impl App {
             KeyCode::Esc | KeyCode::Char('p') => self.close_viewer(),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Открывает показанный в просмотре файл на правку.
+    fn start_editing(&mut self) {
+        let Some(viewer) = &self.viewer else {
+            return;
+        };
+        let Some(content) = &viewer.content else {
+            return;
+        };
+        if !matches!(content.body, Body::Text(_)) {
+            let text = self.text().not_text;
+            self.fail(text);
+            return;
+        }
+        let (path, top) = (content.path.clone(), viewer.top);
+        match Editor::open(&path, self.cfg.indent as usize) {
+            Ok(mut editor) => {
+                // Курсор там, где пользователь читал.
+                editor.down(top);
+                editor.top = top;
+                self.editor = Some(editor);
+            }
+            Err(err) => {
+                let t = self.text();
+                let text = match err {
+                    OpenError::NotText => t.not_text.to_string(),
+                    OpenError::TooLarge => t.too_large.to_string(),
+                    OpenError::Io(err) => format!("{}: {err}", t.cannot_read),
+                };
+                self.fail(text);
+            }
+        }
+    }
+
+    /// Клавиши редактора.
+    fn on_editor_key(&mut self, key: KeyEvent) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return;
+        }
+        let page = editor.rows.max(1);
+        match key.code {
+            KeyCode::Char('s') if ctrl => {
+                if editor.modified {
+                    self.mode = Mode::EditorSave;
+                } else {
+                    let text = self.text().nothing_to_save;
+                    self.info(text);
+                }
+            }
+            KeyCode::Home if ctrl => editor.file_start(),
+            KeyCode::End if ctrl => editor.file_end(),
+            _ if ctrl => {}
+            KeyCode::Esc => {
+                if editor.modified {
+                    self.mode = Mode::EditorExit;
+                } else {
+                    self.close_editor();
+                }
+            }
+            KeyCode::Char(c) => editor.insert(c),
+            KeyCode::Enter => editor.newline(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Tab => editor.tab(),
+            KeyCode::BackTab => editor.backtab(),
+            KeyCode::Up => editor.up(1),
+            KeyCode::Down => editor.down(1),
+            KeyCode::Left => editor.left(),
+            KeyCode::Right => editor.right(),
+            KeyCode::Home => editor.home(),
+            KeyCode::End => editor.end(),
+            KeyCode::PageUp => editor.up(page),
+            KeyCode::PageDown => editor.down(page),
+            _ => {}
+        }
+    }
+
+    /// Подтверждение сохранения: `y` или Enter сохраняют, остальное отменяет.
+    fn on_save_key(&mut self, code: KeyCode) {
+        self.mode = Mode::Normal;
+        if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
+            self.save_editor();
+        }
+    }
+
+    /// Выход с несохранёнными изменениями: `y` — сохранить и закрыть,
+    /// `n` — закрыть без сохранения, Esc — вернуться к правке.
+    fn on_exit_key(&mut self, code: KeyCode) {
+        self.mode = Mode::Normal;
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if self.save_editor() {
+                    self.close_editor();
+                }
+            }
+            KeyCode::Char('n') => self.close_editor(),
+            _ => {}
+        }
+    }
+
+    /// Записывает файл редактора; `false` — не удалось.
+    fn save_editor(&mut self) -> bool {
+        let Some(editor) = &mut self.editor else {
+            return false;
+        };
+        match editor.save() {
+            Ok(()) => {
+                // Размер и время файла изменились — панели и просмотр тоже.
+                self.refresh_panels();
+                let text = self.text().saved;
+                self.info(text);
+                true
+            }
+            Err(err) => {
+                let text = format!("{}: {err}", self.text().save_failed);
+                self.fail(text);
+                false
+            }
+        }
+    }
+
+    /// Закрывает редактор и перечитывает просмотр: файл мог измениться.
+    fn close_editor(&mut self) {
+        let top = self.editor.take().map(|e| e.top);
+        if let Some(viewer) = &mut self.viewer {
+            viewer.path = None;
+        }
+        self.sync_viewer();
+        if let (Some(viewer), Some(top)) = (&mut self.viewer, top) {
+            viewer.top = top;
         }
     }
 
@@ -989,5 +1141,102 @@ mod tests {
         // Просмотр снова показывает вторую панель.
         press(&mut app, KeyCode::Char('p'));
         assert_eq!(app.hidden, None);
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    /// Открывает `main.rs` в редакторе.
+    fn editing() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {\n}\n").unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Enter);
+        wait_preview(&mut app);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.editor.is_some());
+        (tmp, app)
+    }
+
+    #[test]
+    fn edit_and_save_with_confirmation() {
+        let (tmp, mut app) = editing();
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        for c in "run();".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        // Клавиши ушли в редактор, а не в панели: `e`, `p`, `q` — просто буквы.
+        assert_eq!(app.editor.as_ref().unwrap().lines[1], "    run();");
+
+        ctrl(&mut app, 's');
+        assert!(matches!(app.mode, Mode::EditorSave));
+        // Отказ — файл не тронут.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("main.rs")).unwrap(),
+            "fn main() {\n}\n"
+        );
+
+        ctrl(&mut app, 's');
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("main.rs")).unwrap(),
+            "fn main() {\n    run();\n}\n"
+        );
+        assert!(!app.editor.as_ref().unwrap().modified);
+        assert!(app.status.as_ref().unwrap().text.contains("saved"));
+
+        // Без изменений Esc закрывает сразу; просмотр перечитывает файл.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.editor.is_none());
+        assert!(app.viewer.is_some());
+        wait_preview(&mut app);
+    }
+
+    #[test]
+    fn esc_with_changes_asks_and_can_discard() {
+        let (tmp, mut app) = editing();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::EditorExit));
+        // Esc в диалоге — назад к правке.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.editor.is_some());
+        assert!(matches!(app.mode, Mode::Normal));
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.editor.is_none());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("main.rs")).unwrap(),
+            "fn main() {\n}\n"
+        );
+    }
+
+    #[test]
+    fn exit_dialog_can_save() {
+        let (tmp, mut app) = editing();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.editor.is_none());
+        assert!(
+            std::fs::read_to_string(tmp.path().join("main.rs"))
+                .unwrap()
+                .starts_with("xfn")
+        );
+    }
+
+    #[test]
+    fn directories_cannot_be_edited() {
+        let (_tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Char('p')); // курсор на sub/
+        press(&mut app, KeyCode::Tab);
+        wait_preview(&mut app);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.editor.is_none());
+        assert!(app.status.as_ref().unwrap().error);
     }
 }

@@ -53,13 +53,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_confirm(frame, main, *permanent, targets, &app.theme, app.text());
         }
         Mode::Job(job) => draw_job(frame, main, job, &app.theme, app.text()),
+        Mode::EditorSave | Mode::EditorExit => draw_save(frame, main, app),
     }
 }
 
 /// Сторона окна: файловая панель или просмотр на её месте.
 fn draw_side(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
     if app.viewer.as_ref().is_some_and(|v| v.side == side) {
-        draw_viewer(frame, area, app, side);
+        if app.editor.is_some() {
+            draw_editor(frame, area, app, side);
+        } else {
+            draw_viewer(frame, area, app, side);
+        }
     } else {
         draw_panel(frame, area, app, side);
     }
@@ -376,6 +381,14 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
 fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let t = app.text();
     match &app.mode {
+        Mode::Normal if app.editor.is_some() => vec![
+            ("Ctrl+S", t.hint_save),
+            ("Esc", t.hint_exit),
+            ("Tab", t.hint_indent),
+            ("Shift+Tab", t.hint_dedent),
+        ],
+        Mode::EditorSave => vec![("y", t.save), ("Esc", t.cancel)],
+        Mode::EditorExit => vec![("y", t.save), ("n", t.discard), ("Esc", t.keep_editing)],
         Mode::Normal if app.viewer_focused() => {
             let wrap = app.viewer.as_ref().is_some_and(|v| v.wrap);
             let mut hints = vec![("↑↓", t.hint_scroll)];
@@ -383,6 +396,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 hints.push(("←→", t.hint_shift));
             }
             hints.extend([
+                ("e", t.hint_edit),
                 ("w", t.hint_wrap),
                 ("/", t.hint_search),
                 ("Tab", t.hint_panel),
@@ -616,6 +630,159 @@ fn hint_line<'a>(hints: &[(&'a str, &'a str)], width: usize, theme: &Theme) -> L
         used += item;
     }
     Line::from(spans)
+}
+
+/// Диалог сохранения из редактора.
+fn draw_save(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme;
+    let t = app.text();
+    let inner = dialog_inner(area);
+    let name = app
+        .editor
+        .as_ref()
+        .map(|e| shorten_path(&display_path(&e.path), inner))
+        .unwrap_or_default();
+    let (title, question, keys): (&str, &str, Vec<(&str, &str)>) = match app.mode {
+        Mode::EditorExit => (
+            t.unsaved_title,
+            t.unsaved_question,
+            vec![("y", t.save), ("n", t.discard), ("Esc", t.keep_editing)],
+        ),
+        _ => (
+            t.save_title,
+            t.save_question,
+            vec![("y", t.save), ("Esc", t.cancel)],
+        ),
+    };
+    let body = vec![
+        Line::raw(question),
+        Line::raw(""),
+        Line::styled(
+            name,
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Line::raw(""),
+        hint_line(&keys, inner, &theme),
+    ];
+    dialog(frame, area, title, body, theme.border(true), &theme);
+}
+
+/// Редактор на месте просмотра: номера строк, подсветка, курсор терминала.
+fn draw_editor(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
+    let active = app.active == side;
+    let theme = app.theme;
+    let t = app.text();
+    let Some(editor) = app.editor.as_mut() else {
+        return;
+    };
+
+    let title_width = (area.width as usize).saturating_sub(8);
+    let mark = if editor.modified { " ●" } else { "" };
+    let title = format!(
+        " ✎ {}{mark} ",
+        shorten_path(&display_path(&editor.path), title_width)
+    );
+    let indent = &editor.indent;
+    let kind = if indent.indent.tabs {
+        t.tabs.to_string()
+    } else {
+        format!("{} {}", t.spaces, indent.indent.size)
+    };
+    let source = match indent.source {
+        crate::indent::Source::EditorConfig => t.from_editorconfig,
+        crate::indent::Source::Detected => t.from_file,
+        crate::indent::Source::Language => t.from_language,
+        crate::indent::Source::Default => t.from_settings,
+    };
+    let mut info = vec![
+        format!(
+            "{} {}, {} {}",
+            t.line_short,
+            editor.row + 1,
+            t.col_short,
+            editor.screen_col(editor.row, editor.col) + 1
+        ),
+        format!("{kind} ({source})"),
+        editor.eol_name().to_string(),
+    ];
+    if let Some(language) = editor.language {
+        info.push(language.name.to_string());
+    }
+    // Подпись набирается по важности: что не влезает в рамку, отбрасывается.
+    let room = (area.width as usize).saturating_sub(4);
+    let mut shown = String::new();
+    for part in info {
+        let next = if shown.is_empty() {
+            part
+        } else {
+            format!("{shown} · {part}")
+        };
+        if next.width() + 2 > room {
+            break;
+        }
+        shown = next;
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border(active))
+        .title(Line::styled(title, theme.title(active)))
+        .title_bottom(Line::styled(format!(" {shown} "), theme.dim()).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let rows = inner.height as usize;
+    let gutter = editor.lines.len().to_string().len() + 1;
+    let avail = (inner.width as usize).saturating_sub(gutter);
+    editor.fit(rows, avail);
+
+    let mut lines = Vec::with_capacity(rows);
+    let last = (editor.top + rows).min(editor.lines.len());
+    for row in editor.top..last {
+        let pieces = editor.highlighted(row).to_vec();
+        // Табуляция раскрывается в пробелы до следующей ступени.
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut x = 0;
+        for piece in &pieces {
+            let style = theme.token(piece.kind);
+            for ch in piece.text.chars() {
+                let w = editor.char_width(ch, x);
+                if ch == '\t' {
+                    cells.extend(std::iter::repeat_n((' ', style), w));
+                } else {
+                    cells.push((ch, style));
+                }
+                x += w;
+            }
+        }
+        let number_style = if row == editor.row {
+            theme.title(true)
+        } else {
+            theme.dim()
+        };
+        let mut spans = vec![Span::styled(
+            format!("{:>w$} ", row + 1, w = gutter - 1),
+            number_style,
+        )];
+        spans.extend(group_cells(slice_cells(&cells, editor.left, avail)));
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    // Настоящий курсор терминала: его видно и в терминалах с особым курсором.
+    if active && matches!(app.mode, Mode::Normal) {
+        let editor = app.editor.as_ref().unwrap();
+        let x = editor
+            .screen_col(editor.row, editor.col)
+            .saturating_sub(editor.left)
+            + gutter;
+        let y = editor.row - editor.top;
+        if x < inner.width as usize && y < rows {
+            frame.set_cursor_position((inner.x + x as u16, inner.y + y as u16));
+        }
+    }
 }
 
 fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
@@ -1299,5 +1466,39 @@ mod tests {
         let sliced: String = slice_cells(&cells, 3, 10).iter().map(|c| c.0).collect();
         assert_eq!(sliced, " 本c");
         assert_eq!(wrap_cells(&[], 5).len(), 1);
+    }
+
+    #[test]
+    fn frame_editor_with_cursor_and_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), "func main() {\n\tx := 1\n}\n").unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        let key = |c| ratatui::crossterm::event::KeyEvent::from(c);
+        use ratatui::crossterm::event::KeyCode;
+        app.on_key(key(KeyCode::Enter));
+        crate::ui::tests::wait_preview(&mut app);
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::End));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines = screen(&mut app, 80, 8);
+        println!("{}", lines.join("\n"));
+        // Табуляция раскрыта на 4 колонки, язык Go — отступ табуляцией.
+        assert!(lines[2].contains("│2     x := 1"), "{}", lines[2]);
+        assert!(lines[6].contains("Ln 2, Col 11"), "{}", lines[6]);
+        assert!(lines[6].contains("tabs (detected)"), "{}", lines[6]);
+        assert!(
+            !lines[6].contains("Go"),
+            "язык не влез и отброшен: {}",
+            lines[6]
+        );
+        assert!(lines[7].contains("Ctrl+S save"));
+        // Курсор терминала после `1`: панель с x=40, рамка, номер (2 колонки), 10 колонок текста.
+        terminal
+            .backend_mut()
+            .assert_cursor_position((40 + 1 + 2 + 10, 2));
     }
 }

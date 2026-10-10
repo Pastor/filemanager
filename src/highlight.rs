@@ -1220,6 +1220,7 @@ struct Open {
 
 /// Построчный разметчик. Состояние между строками — одна незакрытая
 /// конструкция и признак огороженного блока в Markdown.
+#[derive(Clone)]
 pub struct Highlighter {
     grammar: Option<&'static Grammar>,
     open: Option<Open>,
