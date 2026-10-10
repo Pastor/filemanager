@@ -149,6 +149,17 @@ pub struct Text {
     pub from_file: &'static str,
     pub from_language: &'static str,
     pub from_settings: &'static str,
+
+    // Поиск в панели.
+    pub hint_find: &'static str,
+    pub hint_results: &'static str,
+    pub hint_goto: &'static str,
+    pub search_in_files: &'static str,
+    pub search_by_name: &'static str,
+    pub searching: &'static str,
+    pub scanned: &'static str,
+    pub type_to_search: &'static str,
+    pub limit_reached: &'static str,
 }
 
 pub static EN: Text = Text {
@@ -261,6 +272,16 @@ pub static EN: Text = Text {
     from_file: "detected",
     from_language: "language",
     from_settings: "settings",
+
+    hint_find: "find name",
+    hint_results: "results",
+    hint_goto: "go to",
+    search_in_files: "in files",
+    search_by_name: "by name",
+    searching: "searching…",
+    scanned: "files scanned",
+    type_to_search: "type to search",
+    limit_reached: "limit reached",
 };
 
 pub static RU: Text = Text {
@@ -373,4 +394,14 @@ pub static RU: Text = Text {
     from_file: "по файлу",
     from_language: "по языку",
     from_settings: "из настроек",
+
+    hint_find: "поиск имени",
+    hint_results: "результаты",
+    hint_goto: "перейти",
+    search_in_files: "в файлах",
+    search_by_name: "по имени",
+    searching: "поиск…",
+    scanned: "файлов просмотрено",
+    type_to_search: "введите запрос",
+    limit_reached: "достигнут предел",
 };

@@ -9,6 +9,7 @@ mod listing;
 mod ops;
 mod panel;
 mod preview;
+mod search;
 mod ui;
 
 use std::path::{Path, PathBuf};

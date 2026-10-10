@@ -14,6 +14,8 @@ use crate::i18n::Text;
 use crate::listing::{Entry, Kind};
 use crate::ops::Progress;
 use crate::preview::{Body, DirInfo, Preview, TextBody};
+use crate::search::Kind as SearchKind;
+use crate::ui::finder::Finder;
 use crate::ui::job::{Job, JobKind};
 use crate::ui::theme::Theme;
 use crate::ui::viewer::{Search, Viewer};
@@ -65,6 +67,8 @@ fn draw_side(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
         } else {
             draw_viewer(frame, area, app, side);
         }
+    } else if app.finder.as_ref().is_some_and(|f| f.side == side) {
+        draw_finder(frame, area, app);
     } else {
         draw_panel(frame, area, app, side);
     }
@@ -365,6 +369,11 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let width = (area.width as usize).saturating_sub(1);
+    if let Some(finder) = &app.finder {
+        let line = finder_line(finder, width, &theme, app.text());
+        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
+        return;
+    }
     if app.viewer_focused()
         && let Some(search) = app.viewer.as_ref().and_then(|v| v.search.as_ref())
     {
@@ -409,6 +418,8 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("→←", t.hint_in_out),
             ("Tab", t.hint_panel),
             ("p", t.hint_preview),
+            ("/", t.hint_search),
+            ("f", t.hint_find),
             ("Space", t.hint_mark),
             ("c", t.hint_copy),
             ("m", t.hint_move_to),
@@ -434,6 +445,152 @@ fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
         vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
         vec![("R", t.replace_all), ("S", t.skip_all)],
     ]
+}
+
+/// Строка запроса поиска в панели: вид поиска, запрос, клавиши.
+fn finder_line<'a>(finder: &Finder, width: usize, theme: &Theme, t: &'a Text) -> Line<'a> {
+    let (key, label) = match finder.kind {
+        SearchKind::Content => ("/", t.search_in_files),
+        SearchKind::Name => ("f", t.search_by_name),
+    };
+    let mut spans = vec![
+        Span::styled(format!("{key} "), theme.key()),
+        Span::styled(format!("{label}: "), theme.dim()),
+        Span::raw(finder.query.clone()),
+        Span::styled("▏", theme.key()),
+        Span::raw("   "),
+    ];
+    let used: usize = spans.iter().map(Span::width).sum();
+    let keys = hint_line(
+        &[
+            ("↑↓", t.hint_results),
+            ("Enter", t.hint_goto),
+            ("Esc", t.hint_exit),
+        ],
+        width.saturating_sub(used),
+        theme,
+    );
+    spans.extend(keys.spans);
+    Line::from(spans)
+}
+
+/// Список находок на месте файловой панели.
+fn draw_finder(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = app.theme;
+    let t = app.text();
+    let Some(finder) = app.finder.as_mut() else {
+        return;
+    };
+    let label = match finder.kind {
+        SearchKind::Content => t.search_in_files,
+        SearchKind::Name => t.search_by_name,
+    };
+    let title_width = (area.width as usize).saturating_sub(label.width() + 8);
+    let title = format!(
+        " {label}: {} ",
+        shorten_path(&display_path(&finder.root), title_width)
+    );
+    let counter = if finder.hits.is_empty() {
+        String::new()
+    } else {
+        format!(" {}/{} ", finder.cursor + 1, finder.hits.len())
+    };
+    let mut state = format!("{} {}", finder.files, t.scanned);
+    if finder.running {
+        state = format!("{} {state}", t.searching);
+    }
+    if finder.limited {
+        state = format!("{state} · {}", t.limit_reached);
+    }
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border(true))
+        .title(Line::styled(title, theme.title(true)))
+        .title_bottom(Line::styled(format!(" {state} "), theme.dim()).left_aligned())
+        .title_bottom(Line::styled(counter, theme.dim()).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+
+    if finder.hits.is_empty() {
+        let note = if finder.query.is_empty() {
+            t.type_to_search
+        } else if finder.running {
+            t.searching
+        } else {
+            t.no_matches
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {note}"), theme.dim())),
+            inner,
+        );
+        return;
+    }
+
+    finder.fit(rows);
+    let lines: Vec<Line> = finder
+        .hits
+        .iter()
+        .enumerate()
+        .skip(finder.offset)
+        .take(rows)
+        .map(|(i, hit)| {
+            // Путь приглушён, найденное подсвечено, как в просмотре.
+            let mut cells: Vec<Cell> = vec![(' ', Style::default())];
+            let push = |cells: &mut Vec<Cell>, text: &str, style: Style| {
+                cells.extend(text.chars().map(|c| (c, style)));
+            };
+            let found = |cells: &mut Vec<Cell>, text: &str, at: (usize, usize), base: Style| {
+                for (k, ch) in text.chars().enumerate() {
+                    let hit = k >= at.0 && k < at.0 + at.1;
+                    cells.push((
+                        ch,
+                        if hit {
+                            base.patch(theme.found(true))
+                        } else {
+                            base
+                        },
+                    ));
+                }
+            };
+            match hit.line {
+                Some(line) => {
+                    push(&mut cells, &finder.relative(hit), theme.link());
+                    push(&mut cells, &format!(":{}: ", line + 1), theme.dim());
+                    found(&mut cells, &hit.text, hit.at, Style::default());
+                }
+                None => {
+                    let rel = finder.relative(hit);
+                    let parent = rel.strip_suffix(&hit.text).unwrap_or("");
+                    push(&mut cells, parent, theme.dim());
+                    let base = if hit.is_dir {
+                        theme.dir()
+                    } else {
+                        Style::default()
+                    };
+                    found(&mut cells, &hit.text, hit.at, base);
+                    if hit.is_dir {
+                        push(&mut cells, "/", theme.dir());
+                    }
+                }
+            }
+            let cells = slice_cells(&cells, 0, width);
+            let pad = width.saturating_sub(cells.iter().map(|c| c.0.width().unwrap_or(0)).sum());
+            let mut spans = group_cells(cells);
+            spans.push(Span::raw(" ".repeat(pad)));
+            let line = Line::from(spans);
+            if i == finder.cursor {
+                line.patch_style(theme.cursor(true))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Строка ввода поиска вместо подсказок: запрос, счётчик, клавиши.
@@ -1500,5 +1657,36 @@ mod tests {
         terminal
             .backend_mut()
             .assert_cursor_position((40 + 1 + 2 + 10, 2));
+    }
+
+    #[test]
+    fn frame_finder_with_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        let code: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(
+            tmp.path().join("src/a.rs"),
+            format!("{code}fn needle() {{}}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "a needle here\n").unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        app.on_key(KeyEvent::from(KeyCode::Char('/')));
+        for c in "needle".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        crate::ui::tests::wait_finder(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        crate::ui::tests::wait_preview(&mut app);
+        let lines = screen(&mut app, 100, 12);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("notes.txt:1: a needle here"));
+        assert!(all.contains("src/a.rs:31: fn needle() {}"));
+        assert!(all.contains("2/2"));
+        // Справа просмотр на найденной строке.
+        assert!(all.contains("31 fn needle() {}"), "{all}");
+        assert!(lines[11].contains("/ in files: needle"));
     }
 }

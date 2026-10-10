@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::config::Side;
 use crate::preview::{Body, Preview};
+use crate::search::Needle;
 
 /// Шаг горизонтальной прокрутки без переноса строк.
 pub const HSCROLL_STEP: usize = 8;
@@ -67,6 +68,9 @@ pub struct Viewer {
     pub max_top: usize,
     /// Открытый поиск.
     pub search: Option<Search>,
+    /// Найденная строка, которую показать, когда файл загрузится:
+    /// запрос и номер строки.
+    pending: Option<(String, usize)>,
 }
 
 impl Viewer {
@@ -82,6 +86,7 @@ impl Viewer {
             rows: 1,
             max_top: 0,
             search: None,
+            pending: None,
         }
     }
 
@@ -93,6 +98,7 @@ impl Viewer {
         self.top = 0;
         self.left = 0;
         self.search = None;
+        self.pending = None;
     }
 
     /// Принимает результат загрузчика, если он ответ на последний запрос.
@@ -101,7 +107,29 @@ impl Viewer {
             return false;
         }
         self.content = Some(preview);
+        if let Some((query, line)) = self.pending.take() {
+            self.focus(&query, line);
+        }
         true
+    }
+
+    /// Показывает найденное: подсвечивает все вхождения `query` и ставит
+    /// в центр строку `line`. Если файл ещё грузится — сделает это по загрузке.
+    pub fn focus(&mut self, query: &str, line: usize) {
+        if self.content.is_none() {
+            self.pending = Some((query.to_string(), line));
+            return;
+        }
+        if !self.start_search() {
+            return;
+        }
+        self.set_query(query.to_string());
+        if let Some(search) = &mut self.search
+            && let Some(i) = search.matches.iter().position(|m| m.line >= line)
+        {
+            search.current = i;
+        }
+        self.center(line);
     }
 
     /// Сообщает панели размеры области; вызывается при отрисовке.
@@ -192,43 +220,17 @@ impl Viewer {
     }
 }
 
-/// Все вхождения `query` в строках.
-///
-/// Регистр учитывается, только если в запросе есть заглавные буквы: так
-/// строчный запрос находит всё, а с заглавной можно искать точно.
+/// Все вхождения `query` в строках; правила сравнения — [`Needle`].
 pub fn find_all(lines: impl Iterator<Item = String>, query: &str) -> Vec<Match> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let exact = query.chars().any(char::is_uppercase);
-    let fold = |c: char| {
-        if exact {
-            c
-        } else {
-            c.to_lowercase().next().unwrap_or(c)
-        }
-    };
-    let needle: Vec<char> = query.chars().map(fold).collect();
+    let needle = Needle::new(query);
     let mut out = Vec::new();
     for (line, text) in lines.enumerate() {
-        let hay: Vec<char> = text.chars().map(fold).collect();
-        if hay.len() < needle.len() {
-            continue;
-        }
-        let mut i = 0;
-        while i + needle.len() <= hay.len() {
-            if hay[i..i + needle.len()] == needle[..] {
-                out.push(Match {
-                    line,
-                    start: i,
-                    len: needle.len(),
-                });
-                // Вхождения не перекрываются: ищем дальше за найденным.
-                i += needle.len();
-            } else {
-                i += 1;
-            }
-        }
+        out.extend(
+            needle
+                .find(&text)
+                .into_iter()
+                .map(|(start, len)| Match { line, start, len }),
+        );
     }
     out
 }
@@ -354,5 +356,39 @@ mod tests {
         assert_eq!(viewer.left, 0);
         viewer.hscroll(16);
         assert_eq!(viewer.left, 16);
+    }
+
+    #[test]
+    fn focus_waits_for_content() {
+        let mut viewer = Viewer::new(Side::Right, true);
+        viewer.show(PathBuf::from("/x.txt"), 1);
+        viewer.rows = 10;
+        viewer.focus("hit", 40);
+        assert!(viewer.search.is_none());
+
+        let text: String = (0..100)
+            .map(|i| {
+                if i % 20 == 0 {
+                    format!("hit {i}\n")
+                } else {
+                    format!("{i}\n")
+                }
+            })
+            .collect();
+        let body = text_body(Path::new("/x.txt"), &text, false);
+        viewer.loaded(
+            1,
+            Preview {
+                path: PathBuf::from("/x.txt"),
+                size: 0,
+                modified: None,
+                mode: String::new(),
+                owner: String::new(),
+                body: Body::Text(body),
+            },
+        );
+        let search = viewer.search.as_ref().unwrap();
+        assert_eq!(search.current().unwrap().line, 40);
+        assert_eq!(viewer.top, 35);
     }
 }

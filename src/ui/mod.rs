@@ -1,5 +1,6 @@
 //! Состояние приложения, цикл событий и обработка клавиш.
 
+mod finder;
 mod job;
 mod render;
 pub mod theme;
@@ -17,6 +18,8 @@ use crate::i18n::Text;
 use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::Panel;
 use crate::preview::{Body, Loader, Preview};
+use crate::search::Kind as SearchKind;
+use crate::ui::finder::Finder;
 use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::theme::Theme;
 use crate::ui::viewer::{HSCROLL_STEP, Viewer};
@@ -63,6 +66,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     /// Редактор на месте просмотра, если открыт.
     pub editor: Option<Editor>,
+    /// Поиск в панели, если открыт.
+    pub finder: Option<Finder>,
     loader: Loader,
     pub quit: bool,
 }
@@ -96,6 +101,7 @@ impl App {
             mode: Mode::Normal,
             viewer: None,
             editor: None,
+            finder: None,
             loader: Loader::new(),
             quit: false,
         }
@@ -179,7 +185,9 @@ impl App {
         }
         self.status = None;
 
-        if self.viewer_focused() {
+        if self.finder.is_some() {
+            self.on_finder_key(key.code);
+        } else if self.viewer_focused() {
             self.on_viewer_key(key.code);
         } else {
             self.on_files_key(key.code);
@@ -248,6 +256,8 @@ impl App {
                 }
             }
             KeyCode::Esc => self.close_viewer(),
+            KeyCode::Char('/') => self.open_finder(SearchKind::Content),
+            KeyCode::Char('f') => self.open_finder(SearchKind::Name),
             KeyCode::Char('P') => {
                 // Скрытие второй панели закрывает и просмотр на её месте.
                 self.close_viewer();
@@ -298,6 +308,30 @@ impl App {
         let Some(viewer) = &self.viewer else {
             return;
         };
+        // Во время поиска просмотр показывает выбранную находку.
+        if let Some(finder) = &self.finder {
+            let Some(hit) = finder.current() else {
+                return;
+            };
+            let wanted = (hit.path.clone(), hit.line);
+            if finder.shown.as_ref() == Some(&wanted) {
+                return;
+            }
+            let query = finder.query.clone();
+            if viewer.path.as_ref() != Some(&wanted.0) {
+                let request = self.loader.request(wanted.0.clone());
+                if let Some(viewer) = &mut self.viewer {
+                    viewer.show(wanted.0.clone(), request);
+                }
+            }
+            if let (Some(viewer), Some(line)) = (&mut self.viewer, wanted.1) {
+                viewer.focus(&query, line);
+            }
+            if let Some(finder) = &mut self.finder {
+                finder.shown = Some(wanted);
+            }
+            return;
+        }
         let panel = self.panel(viewer.side.other());
         let target = panel
             .current()
@@ -310,6 +344,87 @@ impl App {
         if let Some(viewer) = &mut self.viewer {
             viewer.show(target, request);
         }
+    }
+
+    /// Открывает поиск в активной панели. Если вторая панель видна, в ней
+    /// открывается просмотр находок.
+    fn open_finder(&mut self, kind: SearchKind) {
+        let root = self.panel(self.active).dir.clone();
+        let mut finder = Finder::new(kind, self.active, root, self.cfg.show_hidden);
+        if self.hidden.is_none() && self.viewer.is_none() {
+            self.viewer = Some(Viewer::new(self.active.other(), self.cfg.wrap));
+            finder.opened_viewer = true;
+        }
+        self.finder = Some(finder);
+    }
+
+    /// Закрывает поиск. `go` — перейти к выбранной находке в панели.
+    fn close_finder(&mut self, go: bool) {
+        let Some(finder) = self.finder.take() else {
+            return;
+        };
+        let hit = finder.current().cloned().filter(|_| go);
+        if let Some(hit) = &hit
+            && let Some(dir) = hit.path.parent()
+        {
+            let show = self.cfg.show_hidden;
+            let panel = self.panel_mut(finder.side);
+            match panel.cd(dir.to_path_buf(), show) {
+                Ok(()) => {
+                    panel.select_name(&hit.path.file_name().unwrap_or_default().to_string_lossy())
+                }
+                Err(err) => self.fail_open(dir.to_path_buf(), err),
+            }
+        }
+        // Просмотр, открытый поиском, уходит вместе с ним — если только
+        // пользователь не перешёл к находке: тогда она остаётся на виду.
+        if finder.opened_viewer && hit.is_none() {
+            self.close_viewer();
+        } else if let Some(viewer) = &mut self.viewer {
+            viewer.search = None;
+            if hit.is_none() {
+                viewer.path = None;
+            }
+        }
+        self.active = finder.side;
+    }
+
+    /// Клавиши поиска в панели.
+    fn on_finder_key(&mut self, code: KeyCode) {
+        let Some(finder) = &mut self.finder else {
+            return;
+        };
+        match code {
+            KeyCode::Char(c) => {
+                let query = format!("{}{c}", finder.query);
+                finder.set_query(query);
+                finder.shown = None;
+            }
+            KeyCode::Backspace => {
+                let mut query = finder.query.clone();
+                query.pop();
+                finder.set_query(query);
+                finder.shown = None;
+            }
+            KeyCode::Up => finder.move_by(-1),
+            KeyCode::Down => finder.move_by(1),
+            KeyCode::PageUp => finder.move_by(-(finder.rows as isize)),
+            KeyCode::PageDown => finder.move_by(finder.rows as isize),
+            KeyCode::Home => finder.home(),
+            KeyCode::End => finder.end(),
+            KeyCode::Enter => self.close_finder(true),
+            KeyCode::Esc => self.close_finder(false),
+            _ => {}
+        }
+    }
+
+    /// Сообщение фонового поиска.
+    fn on_finder_msg(&mut self, msg: crate::search::Msg) {
+        if let Some(finder) = &mut self.finder {
+            finder.on_msg(msg);
+        }
+        // Первые находки сразу показываются в просмотре.
+        self.sync_viewer();
     }
 
     /// Результат загрузчика.
@@ -760,7 +875,18 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
             Mode::Job(job) => job.rx.clone(),
             _ => never(),
         };
+        let found = app
+            .finder
+            .as_ref()
+            .and_then(Finder::rx)
+            .unwrap_or_else(never);
         select! {
+            recv(found) -> msg => {
+                if let Ok(msg) = msg {
+                    app.on_finder_msg(msg);
+                    dirty = true;
+                }
+            }
             recv(jobs) -> msg => {
                 match msg {
                     Ok(msg) => app.on_job_msg(msg),
@@ -1238,5 +1364,119 @@ mod tests {
         press(&mut app, KeyCode::Char('e'));
         assert!(app.editor.is_none());
         assert!(app.status.as_ref().unwrap().error);
+    }
+
+    /// Дожидается окончания поиска в панели.
+    pub(super) fn wait_finder(app: &mut App) {
+        while let Some(rx) = app.finder.as_ref().and_then(Finder::rx) {
+            let msg = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("поиск должен закончиться");
+            app.on_finder_msg(msg);
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    fn search_tree() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("deep/er")).unwrap();
+        std::fs::write(tmp.path().join("top.txt"), "nothing\nTODO top\n").unwrap();
+        std::fs::write(tmp.path().join("deep/er/inner.rs"), "// TODO inner\n").unwrap();
+        let app = app_in(tmp.path());
+        (tmp, app)
+    }
+
+    #[test]
+    fn content_search_opens_viewer_and_esc_restores() {
+        let (_tmp, mut app) = search_tree();
+        press(&mut app, KeyCode::Char('/'));
+        // Просмотр открыт поиском во второй панели.
+        assert!(app.viewer.is_some());
+        type_text(&mut app, "todo");
+        wait_finder(&mut app);
+        let finder = app.finder.as_ref().unwrap();
+        assert_eq!(finder.hits.len(), 2);
+        assert_eq!(finder.query, "todo");
+        // Буквы ушли в запрос, а не в команды панели (`d`, `o`).
+        assert!(matches!(app.mode, Mode::Normal));
+
+        wait_preview(&mut app);
+        let viewer = app.viewer.as_ref().unwrap();
+        assert!(viewer.path.as_ref().unwrap().ends_with("top.txt"));
+        assert_eq!(viewer.search.as_ref().unwrap().current().unwrap().line, 1);
+
+        press(&mut app, KeyCode::Down);
+        assert!(
+            app.viewer
+                .as_ref()
+                .unwrap()
+                .path
+                .as_ref()
+                .unwrap()
+                .ends_with("inner.rs")
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.finder.is_none());
+        assert!(
+            app.viewer.is_none(),
+            "просмотр, открытый поиском, закрывается"
+        );
+    }
+
+    #[test]
+    fn enter_goes_to_found_file() {
+        let (tmp, mut app) = search_tree();
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "inner");
+        wait_finder(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.finder.is_none());
+        let panel = app.panel(Side::Left);
+        assert_eq!(panel.dir, tmp.path().join("deep/er"));
+        assert_eq!(panel.current().unwrap().name, "inner.rs");
+        // Просмотр остаётся на найденном файле, без режима поиска.
+        let viewer = app.viewer.as_ref().unwrap();
+        assert!(viewer.search.is_none());
+        assert!(viewer.path.as_ref().unwrap().ends_with("inner.rs"));
+    }
+
+    #[test]
+    fn name_search_finds_directories() {
+        let (tmp, mut app) = search_tree();
+        press(&mut app, KeyCode::Char('f'));
+        type_text(&mut app, "er");
+        wait_finder(&mut app);
+        let names: Vec<String> = app
+            .finder
+            .as_ref()
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| h.text.clone())
+            .collect();
+        assert_eq!(names, ["er", "inner.rs"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.panel(Side::Left).dir, tmp.path().join("deep"));
+        assert_eq!(app.panel(Side::Left).current().unwrap().name, "er");
+    }
+
+    #[test]
+    fn search_without_second_panel_keeps_it_hidden() {
+        let (_tmp, mut app) = search_tree();
+        press(&mut app, KeyCode::Char('P'));
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.viewer.is_none());
+        assert_eq!(app.hidden, Some(Side::Right));
+        type_text(&mut app, "x");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.finder.as_ref().unwrap().query, "");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.finder.is_none());
     }
 }
