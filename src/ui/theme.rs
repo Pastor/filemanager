@@ -9,6 +9,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
+use crate::highlight::Token;
+
 /// Название цветовой схемы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -21,6 +23,24 @@ pub enum ThemeName {
 }
 
 type Rgb = (u8, u8, u8);
+
+/// Цвета подсветки синтаксиса и поиска.
+struct Syntax {
+    comment: Rgb,
+    string: Rgb,
+    number: Rgb,
+    keyword: Rgb,
+    typ: Rgb,
+    key: Rgb,
+    added: Rgb,
+    removed: Rgb,
+    warn: Rgb,
+    /// Фон найденного текста и текущего совпадения.
+    found: Rgb,
+    found_current: Rgb,
+    /// Текст на фоне текущего совпадения.
+    found_ink: Rgb,
+}
 
 /// Цвета одной схемы.
 struct Palette {
@@ -47,6 +67,7 @@ struct Palette {
     cursor_idle_bg: Rgb,
     /// Клавиши в строке подсказок.
     key: Rgb,
+    syntax: Syntax,
 }
 
 const DARK: Palette = Palette {
@@ -62,6 +83,20 @@ const DARK: Palette = Palette {
     cursor_fg: (0xFF, 0xFF, 0xFF),
     cursor_idle_bg: (0x33, 0x36, 0x3C),
     key: (0xE6, 0xC8, 0x55),
+    syntax: Syntax {
+        comment: (0x82, 0x8B, 0x99),
+        string: (0x6F, 0xA8, 0x5A),
+        number: (0xC9, 0x8A, 0x4B),
+        keyword: (0xB0, 0x6B, 0xC9),
+        typ: (0x4E, 0xA3, 0xC4),
+        key: (0x5A, 0x9B, 0xE0),
+        added: (0x5F, 0xA8, 0x5F),
+        removed: (0xD0, 0x5F, 0x5F),
+        warn: (0xE6, 0xC8, 0x55),
+        found: (0x5C, 0x4A, 0x1A),
+        found_current: (0xE6, 0xA8, 0x2E),
+        found_ink: (0x10, 0x10, 0x10),
+    },
 };
 
 const LIGHT: Palette = Palette {
@@ -77,6 +112,20 @@ const LIGHT: Palette = Palette {
     cursor_fg: (0x10, 0x14, 0x18),
     cursor_idle_bg: (0xE6, 0xE6, 0xE3),
     key: (0x95, 0x40, 0x00),
+    syntax: Syntax {
+        comment: (0x6A, 0x73, 0x7D),
+        string: (0x22, 0x86, 0x3A),
+        number: (0xB3, 0x59, 0x00),
+        keyword: (0x8F, 0x3F, 0xBF),
+        typ: (0x1B, 0x7C, 0x83),
+        key: (0x00, 0x5C, 0xC5),
+        added: (0x22, 0x86, 0x3A),
+        removed: (0xCB, 0x24, 0x31),
+        warn: (0x9A, 0x67, 0x00),
+        found: (0xFF, 0xEB, 0x99),
+        found_current: (0xFF, 0xB0, 0x20),
+        found_ink: (0x10, 0x10, 0x10),
+    },
 };
 
 const GRUVBOX: Palette = Palette {
@@ -92,6 +141,20 @@ const GRUVBOX: Palette = Palette {
     cursor_fg: (0xFB, 0xF1, 0xC7),
     cursor_idle_bg: (0x3C, 0x38, 0x36),
     key: (0xFE, 0x80, 0x19),
+    syntax: Syntax {
+        comment: (0x92, 0x83, 0x74),
+        string: (0xB8, 0xBB, 0x26),
+        number: (0xD3, 0x86, 0x9B),
+        keyword: (0xFB, 0x49, 0x34),
+        typ: (0xFA, 0xBD, 0x2F),
+        key: (0x83, 0xA5, 0x98),
+        added: (0xB8, 0xBB, 0x26),
+        removed: (0xFB, 0x49, 0x34),
+        warn: (0xFE, 0x80, 0x19),
+        found: (0x5A, 0x4A, 0x1E),
+        found_current: (0xFA, 0xBD, 0x2F),
+        found_ink: (0x28, 0x28, 0x28),
+    },
 };
 
 const SOLARIZED: Palette = Palette {
@@ -107,6 +170,20 @@ const SOLARIZED: Palette = Palette {
     cursor_fg: (0xEE, 0xE8, 0xD5),
     cursor_idle_bg: (0x07, 0x36, 0x42),
     key: (0xCB, 0x4B, 0x16),
+    syntax: Syntax {
+        comment: (0x7A, 0x8D, 0x93),
+        string: (0x2A, 0xA1, 0x98),
+        number: (0xD3, 0x36, 0x82),
+        keyword: (0x85, 0x99, 0x00),
+        typ: (0xB5, 0x89, 0x00),
+        key: (0x26, 0x8B, 0xD2),
+        added: (0x85, 0x99, 0x00),
+        removed: (0xDC, 0x32, 0x2F),
+        warn: (0xCB, 0x4B, 0x16),
+        found: (0x2E, 0x4A, 0x1E),
+        found_current: (0xB5, 0x89, 0x00),
+        found_ink: (0x00, 0x2B, 0x36),
+    },
 };
 
 const NORD: Palette = Palette {
@@ -122,6 +199,20 @@ const NORD: Palette = Palette {
     cursor_fg: (0xEC, 0xEF, 0xF4),
     cursor_idle_bg: (0x3B, 0x42, 0x52),
     key: (0xEB, 0xCB, 0x8B),
+    syntax: Syntax {
+        comment: (0x8C, 0x98, 0xB0),
+        string: (0xA3, 0xBE, 0x8C),
+        number: (0xB4, 0x8E, 0xAD),
+        keyword: (0x81, 0xA1, 0xC1),
+        typ: (0x8F, 0xBC, 0xBB),
+        key: (0x88, 0xC0, 0xD0),
+        added: (0xA3, 0xBE, 0x8C),
+        removed: (0xBF, 0x61, 0x6A),
+        warn: (0xEB, 0xCB, 0x8B),
+        found: (0x4C, 0x56, 0x6A),
+        found_current: (0xEB, 0xCB, 0x8B),
+        found_ink: (0x2E, 0x34, 0x40),
+    },
 };
 
 impl ThemeName {
@@ -261,6 +352,42 @@ impl Theme {
         self.key()
     }
 
+    /// Фрагмент подсвеченного текста. Обычный текст рисуется цветом темы.
+    pub fn token(&self, token: Token) -> Style {
+        let x = &self.palette().syntax;
+        let color = match token {
+            Token::Plain => return Style::default(),
+            Token::Comment => x.comment,
+            Token::Str => x.string,
+            Token::Number => x.number,
+            Token::Keyword => x.keyword,
+            Token::Type => x.typ,
+            Token::Key => x.key,
+            Token::Added => x.added,
+            Token::Removed => x.removed,
+            Token::Warn => x.warn,
+            Token::Error => {
+                return Style::default()
+                    .fg(self.rgb(x.removed))
+                    .add_modifier(Modifier::BOLD);
+            }
+        };
+        Style::default().fg(self.rgb(color))
+    }
+
+    /// Найденный при поиске текст; текущее совпадение ярче остальных.
+    pub fn found(&self, current: bool) -> Style {
+        let x = &self.palette().syntax;
+        if current {
+            Style::default()
+                .bg(self.rgb(x.found_current))
+                .fg(self.rgb(x.found_ink))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(self.rgb(x.found))
+        }
+    }
+
     /// Сообщение об ошибке.
     pub fn error(&self) -> Style {
         Style::default().fg(self.rgb(self.palette().error))
@@ -361,6 +488,22 @@ mod tests {
                 let c = contrast(color, bg);
                 assert!(c >= 3.0, "{name:?}: {what} контраст {c:.2}");
             }
+            let x = &p.syntax;
+            for (what, color) in [
+                ("comment", x.comment),
+                ("string", x.string),
+                ("number", x.number),
+                ("keyword", x.keyword),
+                ("type", x.typ),
+                ("key", x.key),
+                ("removed", x.removed),
+                ("warn", x.warn),
+            ] {
+                let c = contrast(color, bg);
+                assert!(c >= 3.0, "{name:?}: {what} контраст {c:.2}");
+            }
+            let c = contrast(x.found_ink, x.found_current);
+            assert!(c >= 4.5, "{name:?}: совпадение контраст {c:.2}");
             let c = contrast(p.cursor_fg, p.cursor_bg);
             assert!(c >= 4.5, "{name:?}: курсор контраст {c:.2}");
         }

@@ -1,10 +1,12 @@
 //! fm — двухпанельный TUI-файловый менеджер.
 
 mod config;
+mod highlight;
 mod i18n;
 mod listing;
 mod ops;
 mod panel;
+mod preview;
 mod ui;
 
 use std::path::{Path, PathBuf};

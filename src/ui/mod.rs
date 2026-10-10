@@ -3,6 +3,7 @@
 mod job;
 mod render;
 pub mod theme;
+mod viewer;
 
 use std::path::PathBuf;
 
@@ -14,8 +15,10 @@ use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
 use crate::i18n::Text;
 use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::Panel;
+use crate::preview::{Loader, Preview};
 use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::theme::Theme;
+use crate::ui::viewer::{HSCROLL_STEP, Viewer};
 
 /// Сообщение в строке состояния. Живёт до следующего нажатия клавиши.
 pub struct Status {
@@ -51,6 +54,9 @@ pub struct App {
     pub theme: Theme,
     pub status: Option<Status>,
     pub mode: Mode,
+    /// Панель просмотра, если открыта. Она занимает место одной из панелей.
+    pub viewer: Option<Viewer>,
+    loader: Loader,
     pub quit: bool,
 }
 
@@ -81,6 +87,8 @@ impl App {
             theme,
             status,
             mode: Mode::Normal,
+            viewer: None,
+            loader: Loader::new(),
             quit: false,
         }
     }
@@ -156,8 +164,18 @@ impl App {
         }
         self.status = None;
 
+        if self.viewer_focused() {
+            self.on_viewer_key(key.code);
+        } else {
+            self.on_files_key(key.code);
+        }
+        self.sync_viewer();
+    }
+
+    /// Клавиши файловой панели.
+    fn on_files_key(&mut self, code: KeyCode) {
         let show_hidden = self.cfg.show_hidden;
-        match key.code {
+        match code {
             KeyCode::Up => self.active_panel().move_by(-1),
             KeyCode::Down => self.active_panel().move_by(1),
             KeyCode::PageUp => {
@@ -170,6 +188,20 @@ impl App {
             }
             KeyCode::Home => self.active_panel().home(),
             KeyCode::End => self.active_panel().end(),
+            // Enter на файле открывает его в просмотре и переводит туда фокус.
+            KeyCode::Enter
+                if self
+                    .active_panel()
+                    .current()
+                    .is_some_and(|e| !e.kind.is_dir()) =>
+            {
+                if self.viewer.is_none() {
+                    self.open_viewer();
+                }
+                if let Some(viewer) = &self.viewer {
+                    self.active = viewer.side;
+                }
+            }
             KeyCode::Right | KeyCode::Enter => {
                 let target = self.active_panel().current().map(|e| e.path.clone());
                 if let Err(err) = self.active_panel().enter(show_hidden)
@@ -193,7 +225,17 @@ impl App {
             }
             KeyCode::Char('>') => self.widen(LEFT_PCT_STEP as i16),
             KeyCode::Char('<') => self.widen(-(LEFT_PCT_STEP as i16)),
+            KeyCode::Char('p') => {
+                if self.viewer.is_some() {
+                    self.close_viewer();
+                } else {
+                    self.open_viewer();
+                }
+            }
+            KeyCode::Esc => self.close_viewer(),
             KeyCode::Char('P') => {
+                // Скрытие второй панели закрывает и просмотр на её месте.
+                self.close_viewer();
                 self.hidden = match self.hidden {
                     Some(_) => None,
                     None => Some(self.active.other()),
@@ -216,9 +258,104 @@ impl App {
         }
     }
 
+    /// Фокус в панели просмотра.
+    fn viewer_focused(&self) -> bool {
+        self.viewer.as_ref().is_some_and(|v| v.side == self.active)
+    }
+
+    /// Открывает просмотр на месте второй панели.
+    fn open_viewer(&mut self) {
+        self.hidden = None;
+        self.viewer = Some(Viewer::new(self.active.other(), self.cfg.wrap));
+        self.sync_viewer();
+    }
+
+    /// Закрывает просмотр; фокус возвращается в файловую панель.
+    fn close_viewer(&mut self) {
+        if let Some(viewer) = self.viewer.take() {
+            self.active = viewer.side.other();
+        }
+    }
+
+    /// Просмотр следует за курсором файловой панели: если под курсором
+    /// другой путь, просит загрузчик прочитать его.
+    fn sync_viewer(&mut self) {
+        let Some(viewer) = &self.viewer else {
+            return;
+        };
+        let panel = self.panel(viewer.side.other());
+        let target = panel
+            .current()
+            .map(|e| e.path.clone())
+            .unwrap_or_else(|| panel.dir.clone());
+        if viewer.path.as_ref() == Some(&target) {
+            return;
+        }
+        let request = self.loader.request(target.clone());
+        if let Some(viewer) = &mut self.viewer {
+            viewer.show(target, request);
+        }
+    }
+
+    /// Результат загрузчика.
+    fn on_preview_loaded(&mut self, request: u64, preview: Preview) -> bool {
+        self.viewer
+            .as_mut()
+            .is_some_and(|viewer| viewer.loaded(request, preview))
+    }
+
+    /// Клавиши панели просмотра.
+    fn on_viewer_key(&mut self, code: KeyCode) {
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+        if viewer.search.is_some() {
+            let query = viewer
+                .search
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default();
+            match code {
+                KeyCode::Char(c) => viewer.set_query(format!("{query}{c}")),
+                KeyCode::Backspace => {
+                    let mut query = query;
+                    query.pop();
+                    viewer.set_query(query);
+                }
+                KeyCode::Right | KeyCode::Enter => viewer.jump(1),
+                KeyCode::Left => viewer.jump(-1),
+                KeyCode::Up => viewer.scroll(-1),
+                KeyCode::Down => viewer.scroll(1),
+                KeyCode::PageUp => viewer.page(-1),
+                KeyCode::PageDown => viewer.page(1),
+                KeyCode::Esc => viewer.search = None,
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Up => viewer.scroll(-1),
+            KeyCode::Down => viewer.scroll(1),
+            KeyCode::PageUp => viewer.page(-1),
+            KeyCode::PageDown => viewer.page(1),
+            KeyCode::Home => viewer.home(),
+            KeyCode::End => viewer.end(),
+            KeyCode::Left => viewer.hscroll(-(HSCROLL_STEP as isize)),
+            KeyCode::Right => viewer.hscroll(HSCROLL_STEP as isize),
+            KeyCode::Char('w') => viewer.toggle_wrap(),
+            KeyCode::Char('/') => {
+                viewer.start_search();
+            }
+            KeyCode::Tab => self.active = self.active.other(),
+            KeyCode::Esc | KeyCode::Char('p') => self.close_viewer(),
+            KeyCode::Char('q') => self.quit = true,
+            _ => {}
+        }
+    }
+
     /// Запускает копирование или перенос во вторую панель.
     fn start_transfer(&mut self, op: Transfer) {
-        if self.hidden.is_some() {
+        if self.hidden.is_some() || self.viewer.is_some() {
             let text = self.text().no_second_panel;
             self.fail(text);
             return;
@@ -345,6 +482,11 @@ impl App {
                 self.fail_open(dir, err);
             }
         }
+        // Показанный файл мог измениться или исчезнуть — перечитываем.
+        if let Some(viewer) = &mut self.viewer {
+            viewer.path = None;
+        }
+        self.sync_viewer();
     }
 
     /// Расширяет активную панель на `delta` процентов (сужает при отрицательном).
@@ -450,6 +592,8 @@ fn summary(text: &Text, kind: JobKind, report: &Report) -> String {
 
 fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let events = spawn_events();
+    // Канал загрузчика живёт столько же, сколько приложение.
+    let previews = app.loader.rx.clone();
     let mut dirty = true;
     loop {
         if dirty {
@@ -471,6 +615,11 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
                     Err(_) => app.on_job_lost(),
                 }
                 dirty = true;
+            }
+            recv(previews) -> loaded => {
+                if let Ok((request, preview)) = loaded {
+                    dirty |= app.on_preview_loaded(request, preview);
+                }
             }
             recv(events) -> ev => match ev {
                 Ok(Event::Key(key)) => { app.on_key(key); dirty = true; }
@@ -717,5 +866,128 @@ mod tests {
         finish(&mut app, KeyCode::Esc);
         assert!(!dir.exists());
         assert_eq!(app.panel(Side::Right).dir, tmp.path().join("left"));
+    }
+
+    /// Дожидается загрузки просмотра.
+    pub(super) fn wait_preview(app: &mut App) {
+        let rx = app.loader.rx.clone();
+        while app.viewer.as_ref().is_some_and(|v| v.content.is_none()) {
+            let (request, preview) = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("загрузчик должен ответить");
+            app.on_preview_loaded(request, preview);
+        }
+    }
+
+    fn viewer_dir() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let code: String = (1..=60).map(|i| format!("let x{i} = {i};\n")).collect();
+        std::fs::write(tmp.path().join("main.rs"), code).unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "hello").unwrap();
+        let app = app_in(tmp.path());
+        (tmp, app)
+    }
+
+    #[test]
+    fn p_opens_viewer_that_follows_cursor() {
+        let (tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Char('p'));
+        let viewer = app.viewer.as_ref().unwrap();
+        assert_eq!(viewer.side, Side::Right);
+        assert_eq!(
+            viewer.path.as_deref(),
+            Some(tmp.path().join("sub").as_path())
+        );
+        // Фокус остаётся в списке файлов.
+        assert_eq!(app.active, Side::Left);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.viewer.as_ref().unwrap().path.as_deref(),
+            Some(tmp.path().join("main.rs").as_path())
+        );
+        wait_preview(&mut app);
+        assert!(app.viewer.as_ref().unwrap().content.is_some());
+
+        // Копировать некуда: вторая панель занята просмотром.
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.as_ref().unwrap().error);
+
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn enter_on_file_focuses_viewer_and_esc_returns() {
+        let (_tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Down); // main.rs
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active, Side::Right);
+        wait_preview(&mut app);
+
+        // Клавиши идут в просмотр: прокрутка, перенос.
+        app.viewer.as_mut().unwrap().fit(10, 50);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.viewer.as_ref().unwrap().top, 10);
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!app.viewer.as_ref().unwrap().wrap);
+
+        // Tab — обратно в список, курсор там не двигался.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.active, Side::Left);
+        assert_eq!(app.panel(Side::Left).current().unwrap().name, "main.rs");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_none());
+        assert_eq!(app.active, Side::Left);
+    }
+
+    #[test]
+    fn search_typed_in_viewer() {
+        let (_tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        wait_preview(&mut app);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "x5".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let search = app.viewer.as_ref().unwrap().search.as_ref().unwrap();
+        // x5 и x50..x59.
+        assert_eq!(search.matches.len(), 11);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.viewer
+                .as_ref()
+                .unwrap()
+                .search
+                .as_ref()
+                .unwrap()
+                .current,
+            1
+        );
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            app.viewer.as_ref().unwrap().search.as_ref().unwrap().query,
+            "x"
+        );
+        // Esc закрывает только поиск, просмотр остаётся.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.as_ref().unwrap().search.is_none());
+        assert!(app.viewer.is_some());
+    }
+
+    #[test]
+    fn hiding_second_panel_closes_viewer() {
+        let (_tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.viewer.is_none());
+        assert_eq!(app.hidden, Some(Side::Right));
+        // Просмотр снова показывает вторую панель.
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.hidden, None);
     }
 }

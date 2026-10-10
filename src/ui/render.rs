@@ -9,11 +9,14 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Side;
+use crate::highlight::Piece;
 use crate::i18n::Text;
 use crate::listing::{Entry, Kind};
 use crate::ops::Progress;
+use crate::preview::{Body, DirInfo, Preview, TextBody};
 use crate::ui::job::{Job, JobKind};
 use crate::ui::theme::Theme;
+use crate::ui::viewer::{Search, Viewer};
 use crate::ui::{App, Mode};
 
 /// Ширина колонки размера в однострочном режиме: `1023.9 K`.
@@ -30,15 +33,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main, hints] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
     match app.hidden {
-        Some(hidden) => draw_panel(frame, main, app, hidden.other()),
+        Some(hidden) => draw_side(frame, main, app, hidden.other()),
         None => {
             let [left, right] = Layout::horizontal([
                 Constraint::Percentage(app.left_pct),
                 Constraint::Percentage(100 - app.left_pct),
             ])
             .areas(main);
-            draw_panel(frame, left, app, Side::Left);
-            draw_panel(frame, right, app, Side::Right);
+            draw_side(frame, left, app, Side::Left);
+            draw_side(frame, right, app, Side::Right);
         }
     }
 
@@ -50,6 +53,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_confirm(frame, main, *permanent, targets, &app.theme, app.text());
         }
         Mode::Job(job) => draw_job(frame, main, job, &app.theme, app.text()),
+    }
+}
+
+/// Сторона окна: файловая панель или просмотр на её месте.
+fn draw_side(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
+    if app.viewer.as_ref().is_some_and(|v| v.side == side) {
+        draw_viewer(frame, area, app, side);
+    } else {
+        draw_panel(frame, area, app, side);
     }
 }
 
@@ -347,8 +359,16 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let width = (area.width as usize).saturating_sub(1);
+    if app.viewer_focused()
+        && let Some(search) = app.viewer.as_ref().and_then(|v| v.search.as_ref())
+    {
+        let line = search_line(search, width, &theme, app.text());
+        frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
+        return;
+    }
     let hints = mode_hints(app);
-    let line = hint_line(&hints, (area.width as usize).saturating_sub(1), &theme);
+    let line = hint_line(&hints, width, &theme);
     frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
 }
 
@@ -356,10 +376,25 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
 fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let t = app.text();
     match &app.mode {
+        Mode::Normal if app.viewer_focused() => {
+            let wrap = app.viewer.as_ref().is_some_and(|v| v.wrap);
+            let mut hints = vec![("↑↓", t.hint_scroll)];
+            if !wrap {
+                hints.push(("←→", t.hint_shift));
+            }
+            hints.extend([
+                ("w", t.hint_wrap),
+                ("/", t.hint_search),
+                ("Tab", t.hint_panel),
+                ("Esc", t.hint_close),
+            ]);
+            hints
+        }
         Mode::Normal => vec![
             ("↑↓", t.hint_move),
             ("→←", t.hint_in_out),
             ("Tab", t.hint_panel),
+            ("p", t.hint_preview),
             ("Space", t.hint_mark),
             ("c", t.hint_copy),
             ("m", t.hint_move_to),
@@ -385,6 +420,33 @@ fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
         vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
         vec![("R", t.replace_all), ("S", t.skip_all)],
     ]
+}
+
+/// Строка ввода поиска вместо подсказок: запрос, счётчик, клавиши.
+fn search_line<'a>(search: &Search, width: usize, theme: &Theme, t: &'a Text) -> Line<'a> {
+    let counter = if search.query.is_empty() {
+        String::new()
+    } else if search.matches.is_empty() {
+        t.no_matches.to_string()
+    } else {
+        format!("{}/{}", search.current + 1, search.matches.len())
+    };
+    let mut spans = vec![
+        Span::styled("/", theme.key()),
+        Span::raw(search.query.clone()),
+        Span::styled("▏", theme.key()),
+        Span::raw("  "),
+        Span::styled(counter, theme.dim()),
+        Span::raw("   "),
+    ];
+    let used: usize = spans.iter().map(Span::width).sum();
+    let keys = hint_line(
+        &[("←→", t.hint_prev_next), ("Esc", t.hint_exit)],
+        width.saturating_sub(used),
+        theme,
+    );
+    spans.extend(keys.spans);
+    Line::from(spans)
 }
 
 /// Наибольшая ширина диалога: шире длинные пути читать неудобно.
@@ -554,6 +616,408 @@ fn hint_line<'a>(hints: &[(&'a str, &'a str)], width: usize, theme: &Theme) -> L
         used += item;
     }
     Line::from(spans)
+}
+
+fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
+    let active = app.active == side;
+    let theme = app.theme;
+    let t = app.text();
+    let Some(viewer) = app.viewer.as_mut() else {
+        return;
+    };
+
+    let title_width = (area.width as usize).saturating_sub(4);
+    let title = viewer
+        .path
+        .as_ref()
+        .map(|p| shorten_path(&display_path(p), title_width))
+        .unwrap_or_default();
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border(active))
+        .title(Line::styled(format!(" {title} "), theme.title(active)))
+        .title_bottom(Line::styled(viewer_info(viewer, t), theme.dim()).right_aligned());
+    if let Some(search) = viewer.search.as_ref().filter(|s| !s.query.is_empty()) {
+        let label = match search.matches.len() {
+            0 => format!(" {} ", t.no_matches),
+            n => format!(" {}/{n} ", search.current + 1),
+        };
+        block = block.title_bottom(Line::styled(label, theme.key()).left_aligned());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+
+    let Some(content) = &viewer.content else {
+        viewer.fit(rows, 0);
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {}", t.loading), theme.dim())),
+            inner,
+        );
+        return;
+    };
+
+    // Сначала предел прокрутки — от него зависит, с какой строки рисовать.
+    let lines = match &content.body {
+        Body::Text(text) => {
+            let max_top = text_max_top(text, rows, text_avail(text, width), viewer.wrap);
+            viewer.fit(rows, max_top);
+            text_rows(viewer, rows, width, &theme, t)
+        }
+        body => {
+            let lines = match body {
+                Body::Dir(info) => dir_lines(content, info, width, &theme, t),
+                Body::Binary(dump) => binary_lines(dump, &theme, t),
+                Body::Error(err) => vec![Line::styled(
+                    format!("{}: {err}", t.cannot_read),
+                    theme.error(),
+                )],
+                Body::Text(_) => unreachable!(),
+            };
+            viewer.fit(rows, lines.len().saturating_sub(rows));
+            let left = if viewer.wrap { 0 } else { viewer.left };
+            lines
+                .into_iter()
+                .skip(viewer.top)
+                .take(rows)
+                .map(|line| shift_line(line, left))
+                .collect()
+        }
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Подпись в нижней рамке просмотра: вид, размер, число строк, режимы.
+fn viewer_info(viewer: &Viewer, t: &Text) -> String {
+    let Some(content) = &viewer.content else {
+        return String::new();
+    };
+    let parts: Vec<String> = match &content.body {
+        Body::Text(text) => {
+            let mut parts = vec![
+                text.language.unwrap_or("text").to_string(),
+                format_size(content.size),
+                format!("{} {}", text.lines.len(), t.lines),
+            ];
+            if text.truncated {
+                parts.push(t.truncated.to_string());
+            }
+            if viewer.wrap {
+                parts.push(t.wrap.to_string());
+            }
+            parts
+        }
+        Body::Dir(_) => vec![t.info_directory.to_string()],
+        Body::Binary(_) => vec![t.binary.to_string(), format_size(content.size)],
+        Body::Error(_) => return String::new(),
+    };
+    format!(" {} ", parts.join(" · "))
+}
+
+/// Ширина колонки номеров строк вместе с пробелом после них.
+fn gutter_width(text: &TextBody) -> usize {
+    if text.numbered {
+        text.lines.len().max(1).to_string().len() + 1
+    } else {
+        0
+    }
+}
+
+/// Ширина под текст строки рядом с номерами.
+fn text_avail(text: &TextBody, width: usize) -> usize {
+    width.saturating_sub(gutter_width(text))
+}
+
+/// Сколько экранных строк займёт строка шириной `w` при переносе.
+fn wrapped_rows(w: usize, avail: usize) -> usize {
+    if avail == 0 {
+        1
+    } else {
+        w.div_ceil(avail).max(1)
+    }
+}
+
+/// Наибольшая первая строка, при которой конец файла упирается в низ экрана.
+fn text_max_top(text: &TextBody, rows: usize, avail: usize, wrap: bool) -> usize {
+    let n = text.lines.len();
+    if !wrap {
+        return n.saturating_sub(rows);
+    }
+    let mut used = 0;
+    let mut first = n;
+    while first > 0 {
+        let h = wrapped_rows(text.widths[first - 1], avail);
+        if used + h > rows {
+            break;
+        }
+        used += h;
+        first -= 1;
+    }
+    first
+}
+
+/// Видимые строки текста с номерами, переносом и отметками поиска.
+fn text_rows<'a>(
+    viewer: &Viewer,
+    rows: usize,
+    width: usize,
+    theme: &Theme,
+    t: &Text,
+) -> Vec<Line<'a>> {
+    let Some(Body::Text(text)) = viewer.content.as_ref().map(|c| &c.body) else {
+        return Vec::new();
+    };
+    if text.lines.is_empty() {
+        return vec![Line::styled(t.empty_file.to_string(), theme.dim())];
+    }
+    let gutter = gutter_width(text);
+    let avail = width.saturating_sub(gutter);
+    let mut out = Vec::with_capacity(rows);
+    let mut i = viewer.top;
+    while out.len() < rows && i < text.lines.len() {
+        let cells = styled_cells(&text.lines[i], i, viewer.search.as_ref(), theme);
+        let chunks = if viewer.wrap {
+            wrap_cells(&cells, avail)
+        } else {
+            vec![slice_cells(&cells, viewer.left, avail)]
+        };
+        for (k, chunk) in chunks.into_iter().enumerate() {
+            if out.len() >= rows {
+                break;
+            }
+            let mut spans = Vec::new();
+            if gutter > 0 {
+                let number = if k == 0 {
+                    format!("{:>w$} ", i + 1, w = gutter - 1)
+                } else {
+                    " ".repeat(gutter)
+                };
+                spans.push(Span::styled(number, theme.dim()));
+            }
+            spans.extend(group_cells(chunk));
+            out.push(Line::from(spans));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Символ строки и его стиль.
+type Cell = (char, Style);
+
+/// Раскладывает строку на символы со стилями подсветки и найденного текста.
+fn styled_cells(
+    pieces: &[Piece],
+    line: usize,
+    search: Option<&Search>,
+    theme: &Theme,
+) -> Vec<Cell> {
+    let mut cells: Vec<Cell> = pieces
+        .iter()
+        .flat_map(|p| {
+            let style = theme.token(p.kind);
+            p.text.chars().map(move |c| (c, style))
+        })
+        .collect();
+    if let Some(search) = search {
+        let current = search.current();
+        for m in search.in_line(line) {
+            let style = theme.found(current == Some(*m));
+            for cell in cells.iter_mut().skip(m.start).take(m.len) {
+                cell.1 = cell.1.patch(style);
+            }
+        }
+    }
+    cells
+}
+
+/// Режет строку на куски шириной не больше `avail`. Широкий символ, не
+/// влезающий в остаток, переносится целиком.
+fn wrap_cells(cells: &[Cell], avail: usize) -> Vec<Vec<Cell>> {
+    let mut rows = vec![Vec::new()];
+    if avail == 0 {
+        return rows;
+    }
+    let mut used = 0;
+    for &cell in cells {
+        let w = cell.0.width().unwrap_or(0);
+        if used + w > avail && used > 0 {
+            rows.push(Vec::new());
+            used = 0;
+        }
+        rows.last_mut().unwrap().push(cell);
+        used += w;
+    }
+    rows
+}
+
+/// Видимый кусок строки при горизонтальной прокрутке на `left` колонок.
+fn slice_cells(cells: &[Cell], left: usize, avail: usize) -> Vec<Cell> {
+    let mut out = Vec::new();
+    let mut col = 0;
+    let mut used = 0;
+    for &cell in cells {
+        let w = cell.0.width().unwrap_or(0);
+        if col < left {
+            // Широкий символ, разрезанный краем, заменяется пробелом.
+            if col + w > left {
+                out.push((' ', cell.1));
+                used += 1;
+            }
+            col += w;
+            continue;
+        }
+        if used + w > avail {
+            break;
+        }
+        out.push(cell);
+        used += w;
+        col += w;
+    }
+    out
+}
+
+/// Склеивает соседние символы одного стиля в фрагменты.
+fn group_cells<'a>(cells: Vec<Cell>) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut text = String::new();
+    let mut style = None;
+    for (ch, st) in cells {
+        if style.is_some_and(|s| s != st) {
+            spans.push(Span::styled(std::mem::take(&mut text), style.unwrap()));
+        }
+        style = Some(st);
+        text.push(ch);
+    }
+    if let Some(style) = style {
+        spans.push(Span::styled(text, style));
+    }
+    spans
+}
+
+/// Сдвигает готовую строку влево на `left` колонок.
+fn shift_line(line: Line<'_>, left: usize) -> Line<'_> {
+    if left == 0 {
+        return line;
+    }
+    let cells: Vec<Cell> = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+    Line::from(group_cells(slice_cells(&cells, left, usize::MAX)))
+}
+
+/// Сводка о директории.
+fn dir_lines<'a>(
+    content: &Preview,
+    info: &DirInfo,
+    width: usize,
+    theme: &Theme,
+    t: &Text,
+) -> Vec<Line<'a>> {
+    let name = content
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| content.path.display().to_string());
+    let labels = [
+        t.info_contents,
+        t.info_size,
+        t.info_modified,
+        t.info_permissions,
+    ];
+    let pad = labels.iter().map(|l| l.width()).max().unwrap_or(0) + 2;
+    let row = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label:<pad$}", pad = pad), theme.dim()),
+            Span::raw(value),
+        ])
+    };
+
+    let contents = format!(
+        "{} {} · {} {} · {} {} · {} {}",
+        info.files,
+        t.info_files,
+        info.dirs,
+        t.info_dirs,
+        info.links,
+        t.info_links,
+        info.hidden,
+        t.info_hidden
+    );
+    let size = if info.complete {
+        format!(
+            "{} · {} {}",
+            format_size(info.total_size),
+            info.total_items,
+            t.info_in_items
+        )
+    } else {
+        format!(
+            "{} {} · {} {}",
+            t.info_partial,
+            format_size(info.total_size),
+            info.total_items,
+            t.info_in_items
+        )
+    };
+    let modified = content.modified.map(format_time).unwrap_or_default();
+    let mut lines = vec![
+        Line::styled(format!("{name}/"), theme.dir()),
+        Line::raw(""),
+        row(t.info_contents, contents),
+        row(t.info_size, size),
+        row(t.info_modified, modified),
+        row(
+            t.info_permissions,
+            format!("{} {}", content.mode, content.owner),
+        ),
+    ];
+    if info.largest.is_empty() {
+        return lines;
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(t.info_largest.to_string(), theme.dim()));
+    // Полоса относительно самого крупного; размер справа от неё.
+    let top = info.largest[0].1.max(1);
+    let bar = 10.min(width / 4);
+    for (name, size, is_dir) in &info.largest {
+        let filled = ((*size as f64 / top as f64) * bar as f64).round() as usize;
+        let style = if *is_dir {
+            theme.dir()
+        } else {
+            Style::default()
+        };
+        let suffix = if *is_dir { "/" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled("█".repeat(filled), theme.border(true)),
+            Span::styled("░".repeat(bar - filled), theme.dim()),
+            Span::styled(format!(" {:>8} ", format_size(*size)), theme.dim()),
+            Span::styled(format!("{name}{suffix}"), style),
+        ]));
+    }
+    lines
+}
+
+/// Hex-дамп: смещение приглушено, байты и символы обычным цветом.
+fn binary_lines<'a>(dump: &[String], theme: &Theme, t: &Text) -> Vec<Line<'a>> {
+    if dump.is_empty() {
+        return vec![Line::styled(t.binary.to_string(), theme.dim())];
+    }
+    dump.iter()
+        .map(|line| {
+            let (offset, rest) = line.split_at(line.len().min(8));
+            Line::from(vec![
+                Span::styled(offset.to_string(), theme.dim()),
+                Span::raw(rest.to_string()),
+            ])
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -752,5 +1216,88 @@ mod tests {
         assert!(all.contains("Deleting"));
         assert!(all.contains(" 25%"));
         assert!(all.contains("1/4 · 50 B/200 B"));
+    }
+
+    fn viewer_app(name: &str, text: &str) -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(name), text).unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        crate::ui::tests::wait_preview(&mut app);
+        (tmp, app)
+    }
+
+    #[test]
+    fn frame_source_with_numbers_and_wrap() {
+        let long = format!("let s = \"{}\";", "x".repeat(60));
+        let text = format!("fn main() {{\n    {long}\n}}\n");
+        let (_tmp, mut app) = viewer_app("main.rs", &text);
+        let lines = screen(&mut app, 80, 10);
+        println!("{}", lines.join("\n"));
+        // Справа: номера строк, перенос длинной строки без номера.
+        assert!(lines[1].contains("│1 fn main() {"), "{}", lines[1]);
+        assert!(lines[2].contains("│2     let s"), "{}", lines[2]);
+        assert!(lines[3].contains("│  xxx"), "{}", lines[3]);
+        assert!(lines[8].contains("Rust"), "{}", lines[8]);
+        assert!(lines[8].contains("3 lines"));
+        assert!(lines[9].contains("search"));
+
+        // Без переноса длинная строка обрезается.
+        app.viewer.as_mut().unwrap().toggle_wrap();
+        let lines = screen(&mut app, 80, 10);
+        assert!(lines[3].contains("│3 }"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn frame_search_highlights_and_counts() {
+        let text: String = (0..40).map(|i| format!("row {i}\n")).collect();
+        let (_tmp, mut app) = viewer_app("data.txt", &text);
+        let viewer = app.viewer.as_mut().unwrap();
+        viewer.start_search();
+        viewer.rows = 8;
+        viewer.set_query("row 3".into());
+        let lines = screen(&mut app, 80, 10);
+        println!("{}", lines.join("\n"));
+        // Первое совпадение — `row 3` в середине экрана; всего 11 (3, 30..39).
+        assert!(lines.iter().any(|l| l.contains("1/11")));
+        assert!(lines[9].starts_with(" /row 3"), "{}", lines[9]);
+        // Простой текст — без номеров строк.
+        assert!(lines.iter().any(|l| l.contains("│row 3 ")));
+    }
+
+    #[test]
+    fn frame_directory_info() {
+        let tmp = sample_dir();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn x() {}").unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('p'),
+        ));
+        crate::ui::tests::wait_preview(&mut app);
+        let lines = screen(&mut app, 110, 16);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("src/"));
+        assert!(all.contains("contents"));
+        assert!(all.contains("largest"));
+        assert!(all.contains("1 files · 0 dirs"));
+        assert!(all.contains("lib.rs"));
+        assert!(all.contains("directory"));
+    }
+
+    #[test]
+    fn wrap_and_slice_respect_wide_chars() {
+        let cells: Vec<Cell> = "ab日本c".chars().map(|c| (c, Style::default())).collect();
+        let rows = wrap_cells(&cells, 3);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.0).collect())
+            .collect();
+        assert_eq!(text, ["ab", "日", "本c"]);
+        let sliced: String = slice_cells(&cells, 3, 10).iter().map(|c| c.0).collect();
+        assert_eq!(sliced, " 本c");
+        assert_eq!(wrap_cells(&[], 5).len(), 1);
     }
 }
