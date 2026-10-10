@@ -5,6 +5,7 @@
 //! Прокрутка поэтому идёт целыми колонками — `offset` кратен высоте. Одна
 //! колонка прокручивается построчно.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,8 @@ pub struct Panel {
     pub columns: u8,
     /// Высота колонки на последнем кадре — шаг для PageUp/PageDown.
     pub rows: usize,
+    /// Имена выделенных элементов текущей директории.
+    pub marked: HashSet<String>,
 }
 
 impl Panel {
@@ -39,6 +42,7 @@ impl Panel {
             offset: 0,
             columns: clamp_columns(columns),
             rows: 1,
+            marked: HashSet::new(),
         };
         panel.reload(show_hidden)?;
         Ok(panel)
@@ -53,6 +57,7 @@ impl Panel {
             offset: 0,
             columns: clamp_columns(columns),
             rows: 1,
+            marked: HashSet::new(),
         }
     }
 
@@ -65,6 +70,9 @@ impl Panel {
     pub fn reload(&mut self, show_hidden: bool) -> io::Result<()> {
         let keep = self.current().map(|e| e.name.clone());
         self.entries = listing::read_dir(&self.dir, show_hidden)?;
+        // Выделение исчезнувших (или спрятанных) элементов теряет смысл.
+        let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+        self.marked.retain(|name| names.contains(name.as_str()));
         match keep {
             Some(name) => self.select_name(&name),
             None => self.cursor = 0,
@@ -78,6 +86,7 @@ impl Panel {
         let entries = listing::read_dir(&dir, show_hidden)?;
         self.dir = dir;
         self.entries = entries;
+        self.marked.clear();
         self.cursor = 0;
         self.offset = 0;
         Ok(())
@@ -111,6 +120,44 @@ impl Panel {
             self.select_name(&name);
         }
         Ok(true)
+    }
+
+    /// Переключает выделение элемента под курсором и сдвигает курсор вниз.
+    pub fn toggle_mark(&mut self) {
+        let Some(name) = self.current().map(|e| e.name.clone()) else {
+            return;
+        };
+        if !self.marked.remove(&name) {
+            self.marked.insert(name);
+        }
+        self.move_by(1);
+    }
+
+    /// Элемент выделен.
+    pub fn is_marked(&self, entry: &Entry) -> bool {
+        self.marked.contains(&entry.name)
+    }
+
+    /// Пути, к которым применяется операция: выделенные элементы в порядке
+    /// показа, а если выделения нет — элемент под курсором.
+    pub fn targets(&self) -> Vec<PathBuf> {
+        if self.marked.is_empty() {
+            return self.current().map(|e| e.path.clone()).into_iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|e| self.is_marked(e))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    /// Суммарный размер выделенных файлов (без содержимого директорий).
+    pub fn marked_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| self.is_marked(e) && !e.kind.is_dir())
+            .map(|e| e.size)
+            .sum()
     }
 
     /// Ставит курсор на элемент с данным именем, если он есть.
@@ -304,5 +351,44 @@ mod tests {
         assert_eq!(panel.cursor, 0);
         panel.end();
         assert_eq!(panel.cursor, 4);
+    }
+
+    #[test]
+    fn marks_select_targets_and_survive_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::write(tmp.path().join(name), "xy").unwrap();
+        }
+        let mut panel = Panel::open(tmp.path().to_path_buf(), 1, true).unwrap();
+        // Без выделения цель — элемент под курсором.
+        assert_eq!(panel.targets(), [tmp.path().join("a")]);
+
+        panel.toggle_mark(); // a, курсор на b
+        panel.move_by(1);
+        panel.toggle_mark(); // c, курсор остаётся на последнем
+        assert_eq!(panel.cursor, 2);
+        assert_eq!(
+            panel.targets(),
+            [tmp.path().join("a"), tmp.path().join("c")]
+        );
+        assert_eq!(panel.marked_size(), 4);
+
+        // Повторное нажатие снимает выделение.
+        panel.toggle_mark();
+        assert_eq!(panel.marked.len(), 1);
+
+        fs::remove_file(tmp.path().join("a")).unwrap();
+        panel.reload(true).unwrap();
+        assert!(panel.marked.is_empty());
+    }
+
+    #[test]
+    fn changing_directory_clears_marks() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let mut panel = Panel::open(tmp.path().to_path_buf(), 1, true).unwrap();
+        panel.marked.insert("sub".into());
+        panel.enter(true).unwrap();
+        assert!(panel.marked.is_empty());
     }
 }

@@ -1,18 +1,20 @@
-//! Отрисовка: две панели и строка подсказок.
+//! Отрисовка: две панели, строка подсказок и диалоги поверх них.
 
 use chrono::{DateTime, Local};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::config::Side;
 use crate::i18n::Text;
 use crate::listing::{Entry, Kind};
-use crate::ui::App;
+use crate::ops::Progress;
+use crate::ui::job::{Job, JobKind};
 use crate::ui::theme::Theme;
+use crate::ui::{App, Mode};
 
 /// Ширина колонки размера в однострочном режиме: `1023.9 K`.
 const SIZE_WIDTH: usize = 8;
@@ -41,6 +43,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_hints(frame, hints, app);
+
+    match &app.mode {
+        Mode::Normal => {}
+        Mode::ConfirmDelete { permanent, targets } => {
+            draw_confirm(frame, main, *permanent, targets, &app.theme, app.text());
+        }
+        Mode::Job(job) => draw_job(frame, main, job, &app.theme, app.text()),
+    }
 }
 
 fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
@@ -57,11 +67,20 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
         format!(" {}/{} ", panel.cursor + 1, panel.entries.len())
     };
 
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme.border(active))
         .title(Line::styled(format!(" {title} "), theme.title(active)))
         .title_bottom(Line::styled(counter, theme.dim()).right_aligned());
+    if !panel.marked.is_empty() {
+        let marked = format!(
+            " {}: {} · {} ",
+            text.marked,
+            panel.marked.len(),
+            format_size(panel.marked_size())
+        );
+        block = block.title_bottom(Line::styled(marked, theme.marked()).left_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -108,35 +127,37 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
             .take(rows)
             .map(|(i, entry)| {
                 let cursor = (i == panel.cursor).then_some(active);
-                entry_line(
-                    entry,
-                    rect.width as usize,
-                    columns == 1,
+                let look = Look {
+                    details: columns == 1,
                     cursor,
-                    &theme,
-                    text,
-                )
+                    marked: panel.is_marked(entry),
+                };
+                entry_line(entry, rect.width as usize, look, &theme, text)
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), rect);
     }
 }
 
-/// Строка одного элемента шириной ровно `width`.
-///
-/// `cursor` — `Some(активна ли панель)`, если на элементе стоит курсор.
-/// В режиме одной колонки (`details`) справа выводятся размер и дата, если
-/// для них хватает места.
-fn entry_line<'a>(
-    entry: &Entry,
-    width: usize,
+/// Как показать элемент.
+#[derive(Debug, Clone, Copy)]
+struct Look {
+    /// Режим одной колонки: справа размер и дата, если хватает места.
     details: bool,
+    /// `Some(активна ли панель)`, если на элементе стоит курсор.
     cursor: Option<bool>,
-    theme: &Theme,
-    text: &Text,
-) -> Line<'a> {
-    // Первая позиция зарезервирована под отметку выделения.
-    let prefix = " ";
+    marked: bool,
+}
+
+/// Строка одного элемента шириной ровно `width`.
+fn entry_line<'a>(entry: &Entry, width: usize, look: Look, theme: &Theme, text: &Text) -> Line<'a> {
+    let Look {
+        details,
+        cursor,
+        marked,
+    } = look;
+    // Первая позиция — отметка выделения.
+    let prefix = if marked { "*" } else { " " };
     let avail = width.saturating_sub(prefix.len());
 
     let mut right = String::new();
@@ -171,13 +192,19 @@ fn entry_line<'a>(
     };
     let pad = name_width.saturating_sub(name.width());
 
+    // Выделение перекрашивает строку целиком: его должно быть видно сразу.
+    let (name_style, right_style) = if marked {
+        (theme.marked(), theme.marked())
+    } else {
+        (name_style(entry, theme), theme.dim())
+    };
     let mut spans = vec![
-        Span::raw(prefix),
-        Span::styled(name, name_style(entry, theme)),
+        Span::styled(prefix, theme.marked()),
+        Span::styled(name, name_style),
         Span::raw(" ".repeat(pad)),
     ];
     if !right.is_empty() {
-        spans.push(Span::styled(right, theme.dim()));
+        spans.push(Span::styled(right, right_style));
     }
 
     let line = Line::from(spans);
@@ -320,27 +347,196 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let hints = mode_hints(app);
+    let line = hint_line(&hints, (area.width as usize).saturating_sub(1), &theme);
+    frame.render_widget(Paragraph::new(line), area.inner(Margin::new(1, 0)));
+}
+
+/// Клавиши текущего режима для строки подсказок.
+fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let t = app.text();
-    let hints: [(&str, &str); 8] = [
-        ("↑↓", t.hint_move),
-        ("→←", t.hint_in_out),
-        ("Tab", t.hint_panel),
-        ("<>", t.hint_width),
-        ("P", t.hint_hide),
-        ("1-3", t.hint_columns),
-        (".", t.hint_hidden),
-        ("q", t.hint_quit),
+    match &app.mode {
+        Mode::Normal => vec![
+            ("↑↓", t.hint_move),
+            ("→←", t.hint_in_out),
+            ("Tab", t.hint_panel),
+            ("Space", t.hint_mark),
+            ("c", t.hint_copy),
+            ("m", t.hint_move_to),
+            ("d", t.hint_delete),
+            ("P", t.hint_hide),
+            ("<>", t.hint_width),
+            ("1-3", t.hint_columns),
+            (".", t.hint_hidden),
+            ("q", t.hint_quit),
+        ],
+        Mode::ConfirmDelete { permanent, .. } => vec![
+            (if *permanent { "D" } else { "d" }, t.confirm),
+            ("Esc", t.cancel),
+        ],
+        Mode::Job(job) if job.conflict.is_some() => conflict_hints(t).concat(),
+        Mode::Job(_) => vec![("Esc", t.cancel)],
+    }
+}
+
+/// Ответы на конфликт имён двумя строками: частые и «для всех».
+fn conflict_hints(t: &'static Text) -> [Vec<(&'static str, &'static str)>; 2] {
+    [
+        vec![("r", t.replace), ("s", t.skip), ("Esc", t.cancel)],
+        vec![("R", t.replace_all), ("S", t.skip_all)],
+    ]
+}
+
+/// Наибольшая ширина диалога: шире длинные пути читать неудобно.
+const DIALOG_MAX_WIDTH: u16 = 72;
+
+/// Рисует диалог по центру `area`. Ширина подбирается под содержимое.
+fn dialog(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: Vec<Line>,
+    border: Style,
+    theme: &Theme,
+) {
+    // Рамка и поля по одному символу с каждой стороны.
+    let content = body.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (content + 4)
+        .max(title.width() as u16 + 6)
+        .clamp(30, DIALOG_MAX_WIDTH)
+        .min(area.width);
+    let height = (body.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(Line::styled(format!(" {title} "), border))
+        .padding(Padding::horizontal(1))
+        .style(theme.base());
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(body).block(block), rect);
+}
+
+/// Ширина текста внутри диалога наибольшей ширины.
+fn dialog_inner(area: Rect) -> usize {
+    (DIALOG_MAX_WIDTH.min(area.width) as usize).saturating_sub(4)
+}
+
+fn draw_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    permanent: bool,
+    targets: &[std::path::PathBuf],
+    theme: &Theme,
+    t: &Text,
+) {
+    let inner = dialog_inner(area);
+    let (title, question, border) = if permanent {
+        (t.delete_forever_title, t.delete_forever, theme.error())
+    } else {
+        (t.delete_title, t.delete_to_trash, theme.border(true))
+    };
+    let what = match targets {
+        [one] => shorten_path(&display_path(one), inner),
+        many => format!("{}: {}", t.items, many.len()),
+    };
+    let key = if permanent { "D" } else { "d" };
+    let body = vec![
+        Line::raw(question),
+        Line::raw(""),
+        Line::styled(
+            what,
+            Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Line::raw(""),
+        hint_line(&[(key, t.confirm), ("Esc", t.cancel)], inner, theme),
     ];
-    frame.render_widget(
-        Paragraph::new(hint_line(&hints, area.width as usize, &theme)),
-        area,
-    );
+    dialog(frame, area, title, body, border, theme);
+}
+
+fn draw_job(frame: &mut Frame, area: Rect, job: &Job, theme: &Theme, t: &'static Text) {
+    let inner = dialog_inner(area);
+    let title = match job.kind {
+        JobKind::Copy => t.job_copy,
+        JobKind::Move => t.job_move,
+        JobKind::Trash => t.job_trash,
+        JobKind::Delete => t.job_delete,
+    };
+    let p = &job.progress;
+    let current = shorten_path(&display_path(&p.current), inner);
+    let footer = if job.cancelling {
+        Line::styled(t.cancelling, theme.dim())
+    } else {
+        hint_line(&[("Esc", t.cancel)], inner, theme)
+    };
+    // Вопрос о конфликте заменяет окно прогресса: два окна друг на друге
+    // читаются хуже, а прогресс, пока операция ждёт ответа, всё равно стоит.
+    if let Some((path, _)) = &job.conflict {
+        let mut body = vec![
+            Line::styled(
+                shorten_path(&display_path(path), inner),
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ];
+        for row in conflict_hints(t) {
+            body.push(hint_line(&row, inner, theme));
+        }
+        dialog(frame, area, t.conflict_exists, body, theme.error(), theme);
+        return;
+    }
+    let body = vec![
+        Line::styled(current, theme.dim()),
+        gauge(p, inner, theme),
+        Line::styled(counters(p), theme.dim()),
+        Line::raw(""),
+        footer,
+    ];
+    dialog(frame, area, title, body, theme.border(true), theme);
+}
+
+/// Полоса прогресса с процентом. Доля считается по байтам, а если байтов
+/// нет (пустые файлы, удаление) — по числу элементов.
+fn gauge<'a>(p: &Progress, width: usize, theme: &Theme) -> Line<'a> {
+    let ratio = if p.bytes_total > 0 {
+        p.bytes_done as f64 / p.bytes_total as f64
+    } else if p.items_total > 0 {
+        p.items_done as f64 / p.items_total as f64
+    } else {
+        0.0
+    };
+    let ratio = ratio.clamp(0.0, 1.0);
+    let bar = width.saturating_sub(5);
+    let filled = ((bar as f64) * ratio).round() as usize;
+    Line::from(vec![
+        Span::styled("█".repeat(filled), theme.border(true)),
+        Span::styled("░".repeat(bar - filled), theme.dim()),
+        Span::raw(format!(" {:>3}%", (ratio * 100.0).round() as u32)),
+    ])
+}
+
+/// Счётчики операции: «12/40 · 1.5 M/20.0 M».
+fn counters(p: &Progress) -> String {
+    let mut out = format!("{}/{}", p.items_done, p.items_total);
+    if p.bytes_total > 0 {
+        out.push_str(&format!(
+            " · {}/{}",
+            format_size(p.bytes_done),
+            format_size(p.bytes_total)
+        ));
+    }
+    out
 }
 
 /// Собирает строку подсказок; то, что не влезает, заменяется многоточием.
 fn hint_line<'a>(hints: &[(&'a str, &'a str)], width: usize, theme: &Theme) -> Line<'a> {
-    let mut spans = vec![Span::raw(" ")];
-    let mut used = 1;
+    let mut spans = Vec::new();
+    let mut used = 0;
     for (i, (key, desc)) in hints.iter().enumerate() {
         let item = key.width() + 1 + desc.width() + 2;
         // Последний элемент не обязан оставлять место под многоточие.
@@ -420,14 +616,12 @@ mod tests {
         };
         for width in [0, 5, 20, 40, 80] {
             for details in [false, true] {
-                let line = entry_line(
-                    &entry,
-                    width,
+                let look = Look {
                     details,
-                    Some(true),
-                    &theme,
-                    crate::i18n::Lang::En.text(),
-                );
+                    cursor: Some(true),
+                    marked: details,
+                };
+                let line = entry_line(&entry, width, look, &theme, crate::i18n::Lang::En.text());
                 assert_eq!(
                     line.width(),
                     width.max(1),
@@ -445,7 +639,7 @@ mod tests {
         };
         let hints = [("a", "alpha"), ("b", "beta"), ("c", "gamma")];
         for width in 0..40 {
-            assert!(hint_line(&hints, width, &theme).width() <= width.max(1));
+            assert!(hint_line(&hints, width, &theme).width() <= width);
         }
     }
 
@@ -483,7 +677,8 @@ mod tests {
         println!("{}", lines.join("\n"));
         assert!(lines[1].matches("src/").count() == 2, "{}", lines[1]);
         assert!(lines[1].contains("<DIR>"));
-        assert!(lines[11].contains("quit"));
+        assert!(lines[11].contains("move"));
+        assert!(lines[11].contains("copy"));
         // Счётчик позиции в нижней рамке.
         assert!(lines[10].contains("1/32"));
     }
@@ -501,5 +696,61 @@ mod tests {
         assert_eq!(lines[1].matches('│').count(), 4, "{}", lines[1]);
         assert!(lines.iter().any(|l| l.contains("file29.txt")));
         assert!(!lines.iter().any(|l| l.contains("Cargo.toml")));
+    }
+
+    #[test]
+    fn frame_marks_and_delete_dialog() {
+        let tmp = sample_dir();
+        let mut app = App::new_for_test(tmp.path());
+        let targets = app.panel(Side::Left).targets();
+        app.panel_mut(Side::Left).toggle_mark();
+        app.panel_mut(Side::Left).toggle_mark();
+        app.mode = Mode::ConfirmDelete {
+            permanent: true,
+            targets,
+        };
+        let lines = screen(&mut app, 100, 16);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("Delete permanently"));
+        assert!(all.contains("cannot be undone"));
+        assert!(lines[2].starts_with("│*Cargo.toml"), "{}", lines[2]);
+        assert!(lines[15].contains("D confirm"));
+        // Счётчик выделенного в нижней рамке: src/ и Cargo.toml (9 байт).
+        assert!(lines[14].contains("marked: 2 · 9 B"), "{}", lines[14]);
+    }
+
+    #[test]
+    fn frame_job_with_conflict() {
+        let tmp = sample_dir();
+        let mut app = App::new_for_test(tmp.path());
+        let mut job = Job::delete(Vec::new(), false, Side::Left);
+        job.progress = Progress {
+            bytes_total: 200,
+            bytes_done: 50,
+            items_total: 4,
+            items_done: 1,
+            current: tmp.path().join("Cargo.toml"),
+        };
+        let (reply, _answers) = crossbeam_channel::bounded(1);
+        job.conflict = Some((tmp.path().join("src"), reply));
+        app.mode = Mode::Job(job);
+        let lines = screen(&mut app, 100, 16);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("Already exists"));
+        assert!(all.contains("R replace all"));
+        assert!(lines[15].contains("r replace"));
+
+        // Без вопроса виден прогресс: доля по байтам и счётчики.
+        if let Mode::Job(job) = &mut app.mode {
+            job.conflict = None;
+        }
+        let lines = screen(&mut app, 100, 16);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("Deleting"));
+        assert!(all.contains(" 25%"));
+        assert!(all.contains("1/4 · 50 B/200 B"));
     }
 }

@@ -256,6 +256,11 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Выделенный элемент.
+    pub fn marked(&self) -> Style {
+        self.key()
+    }
+
     /// Сообщение об ошибке.
     pub fn error(&self) -> Style {
         Style::default().fg(self.rgb(self.palette().error))

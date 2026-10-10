@@ -1,23 +1,40 @@
 //! Состояние приложения, цикл событий и обработка клавиш.
 
+mod job;
 mod render;
 pub mod theme;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, select, unbounded};
+use crossbeam_channel::{Receiver, Sender, never, select, unbounded};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
 use crate::i18n::Text;
+use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::Panel;
+use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::theme::Theme;
 
 /// Сообщение в строке состояния. Живёт до следующего нажатия клавиши.
 pub struct Status {
     pub text: String,
     pub error: bool,
+}
+
+/// Что сейчас происходит на экране поверх панелей.
+pub enum Mode {
+    /// Обычная работа с панелями.
+    Normal,
+    /// Ожидание подтверждения удаления.
+    ConfirmDelete {
+        /// Безвозвратно, а не в корзину.
+        permanent: bool,
+        targets: Vec<PathBuf>,
+    },
+    /// Выполняется файловая операция.
+    Job(Job),
 }
 
 /// Состояние приложения.
@@ -33,6 +50,7 @@ pub struct App {
     pub cfg: Config,
     pub theme: Theme,
     pub status: Option<Status>,
+    pub mode: Mode,
     pub quit: bool,
 }
 
@@ -62,6 +80,7 @@ impl App {
             cfg,
             theme,
             status,
+            mode: Mode::Normal,
             quit: false,
         }
     }
@@ -115,8 +134,18 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            // Операция сначала сворачивается: выход случится по её отчёту.
+            if let Mode::Job(job) = &mut self.mode {
+                job.cancel();
+            }
             self.quit = true;
             return;
+        }
+        // Пока идёт операция или открыт диалог, клавиши принадлежат им.
+        match self.mode {
+            Mode::Normal => {}
+            Mode::ConfirmDelete { .. } => return self.on_confirm_key(key.code),
+            Mode::Job(_) => return self.on_job_key(key.code),
         }
         // Сочетания с Ctrl и Alt пока не используются; Shift входит в сам символ.
         if key
@@ -177,8 +206,144 @@ impl App {
                 self.info(text);
             }
             KeyCode::Char('.') => self.toggle_hidden(),
+            KeyCode::Char(' ') => self.active_panel().toggle_mark(),
+            KeyCode::Char('c') => self.start_transfer(Transfer::Copy),
+            KeyCode::Char('m') => self.start_transfer(Transfer::Move),
+            KeyCode::Char('d') => self.ask_delete(!self.cfg.use_trash),
+            KeyCode::Char('D') => self.ask_delete(true),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Запускает копирование или перенос во вторую панель.
+    fn start_transfer(&mut self, op: Transfer) {
+        if self.hidden.is_some() {
+            let text = self.text().no_second_panel;
+            self.fail(text);
+            return;
+        }
+        let sources = self.panel(self.active).targets();
+        if sources.is_empty() {
+            return;
+        }
+        let dest = self.panel(self.active.other()).dir.clone();
+        if let Err(problem) = ops::check(&sources, &dest) {
+            let text = self.text();
+            self.fail(match problem {
+                Problem::SameDir => text.same_dir,
+                Problem::IntoItself => text.into_itself,
+            });
+            return;
+        }
+        self.mode = Mode::Job(Job::transfer(op, sources, dest, self.active));
+    }
+
+    /// Открывает подтверждение удаления.
+    fn ask_delete(&mut self, permanent: bool) {
+        let targets = self.panel(self.active).targets();
+        if !targets.is_empty() {
+            self.mode = Mode::ConfirmDelete { permanent, targets };
+        }
+    }
+
+    /// Клавиши диалога удаления: повтор той же клавиши подтверждает,
+    /// любая другая отменяет.
+    fn on_confirm_key(&mut self, code: KeyCode) {
+        let Mode::ConfirmDelete { permanent, targets } =
+            std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return;
+        };
+        let confirm = if permanent { 'D' } else { 'd' };
+        if code == KeyCode::Char(confirm) {
+            self.mode = Mode::Job(Job::delete(targets, !permanent, self.active));
+        }
+    }
+
+    /// Клавиши во время операции: ответы на конфликт и отмена.
+    fn on_job_key(&mut self, code: KeyCode) {
+        let Mode::Job(job) = &mut self.mode else {
+            return;
+        };
+        if job.conflict.is_some() {
+            let choice = match code {
+                KeyCode::Char('r') => Choice::Replace,
+                KeyCode::Char('s') => Choice::Skip,
+                KeyCode::Char('R') => Choice::ReplaceAll,
+                KeyCode::Char('S') => Choice::SkipAll,
+                KeyCode::Esc => Choice::Cancel,
+                _ => return,
+            };
+            job.answer(choice);
+        } else if code == KeyCode::Esc {
+            job.cancel();
+        }
+    }
+
+    /// Сообщение от фоновой операции.
+    fn on_job_msg(&mut self, msg: JobMsg) {
+        let Mode::Job(job) = &mut self.mode else {
+            return;
+        };
+        match msg {
+            JobMsg::Progress(progress) => job.progress = progress,
+            JobMsg::Conflict(path, reply) => {
+                job.conflict = Some((path, reply));
+                // Отмену могли запросить, пока вопрос был в пути.
+                if job.cancelling {
+                    job.answer(Choice::Cancel);
+                }
+            }
+            JobMsg::Done(report) => {
+                let (kind, source) = (job.kind, job.source);
+                self.mode = Mode::Normal;
+                self.finish_job(kind, source, report);
+            }
+        }
+    }
+
+    /// Поток операции исчез, не прислав отчёта (например, паника).
+    fn on_job_lost(&mut self) {
+        if let Mode::Job(job) = std::mem::replace(&mut self.mode, Mode::Normal) {
+            self.panel_mut(job.source).marked.clear();
+        }
+        self.refresh_panels();
+        let text = self.text().job_lost;
+        self.fail(text);
+    }
+
+    /// Обновляет панели после операции и сообщает итог.
+    fn finish_job(&mut self, kind: JobKind, source: Side, report: Report) {
+        self.panel_mut(source).marked.clear();
+        self.refresh_panels();
+        let text = summary(self.text(), kind, &report);
+        if report.errors.is_empty() {
+            self.info(text);
+        } else {
+            self.fail(text);
+        }
+    }
+
+    /// Перечитывает обе панели. Если директория панели исчезла (её удалили
+    /// или перенесли), панель поднимается до ближайшего существующего предка.
+    fn refresh_panels(&mut self) {
+        let show = self.cfg.show_hidden;
+        for side in [Side::Left, Side::Right] {
+            let panel = self.panel_mut(side);
+            if panel.reload(show).is_ok() {
+                continue;
+            }
+            let mut dir = panel.dir.clone();
+            while !dir.is_dir() {
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+            if let Err(err) = panel.cd(dir.clone(), show) {
+                self.fail_open(dir, err);
+            }
         }
     }
 
@@ -258,6 +423,31 @@ pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<(
     Ok(())
 }
 
+/// Итог операции одной строкой: «скопировано: 3, пропущено: 1, ошибок: 2 — …».
+fn summary(text: &Text, kind: JobKind, report: &Report) -> String {
+    let verb = match kind {
+        JobKind::Copy => text.done_copy,
+        JobKind::Move => text.done_move,
+        JobKind::Trash => text.done_trash,
+        JobKind::Delete => text.done_delete,
+    };
+    let mut parts = vec![format!("{verb}: {}", report.done)];
+    if report.skipped > 0 {
+        parts.push(format!("{}: {}", text.skipped, report.skipped));
+    }
+    if report.cancelled {
+        parts.push(text.cancelled.to_string());
+    }
+    if let Some(first) = report.errors.first() {
+        parts.push(format!(
+            "{}: {} — {first}",
+            text.errors,
+            report.errors.len()
+        ));
+    }
+    parts.join(", ")
+}
+
 fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let events = spawn_events();
     let mut dirty = true;
@@ -266,10 +456,22 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
             terminal.draw(|frame| render::draw(frame, app))?;
             dirty = false;
         }
-        if app.quit {
+        // Выход ждёт окончания операции: оборванное копирование хуже задержки.
+        if app.quit && !matches!(app.mode, Mode::Job(_)) {
             return Ok(());
         }
+        let jobs = match &app.mode {
+            Mode::Job(job) => job.rx.clone(),
+            _ => never(),
+        };
         select! {
+            recv(jobs) -> msg => {
+                match msg {
+                    Ok(msg) => app.on_job_msg(msg),
+                    Err(_) => app.on_job_lost(),
+                }
+                dirty = true;
+            }
             recv(events) -> ev => match ev {
                 Ok(Event::Key(key)) => { app.on_key(key); dirty = true; }
                 Ok(Event::Resize(_, _)) => dirty = true,
@@ -377,5 +579,143 @@ mod tests {
         assert_eq!(app.cfg.session.left_columns, 2);
         assert_eq!(app.cfg.session.hidden, Some(Side::Right));
         assert_eq!(app.cfg.session.right.as_deref(), Some(tmp.path()));
+    }
+
+    /// Дожидается конца операции, отвечая на конфликты клавишей `answer`.
+    fn finish(app: &mut App, answer: KeyCode) {
+        while let Mode::Job(job) = &app.mode {
+            let msg = job.rx.recv().expect("операция должна прислать отчёт");
+            app.on_job_msg(msg);
+            if matches!(&app.mode, Mode::Job(job) if job.conflict.is_some()) {
+                press(app, answer);
+            }
+        }
+    }
+
+    /// Две директории: `left` с файлами и пустая `right`; правая панель в `right`.
+    fn two_dirs() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (left, right) = (tmp.path().join("left"), tmp.path().join("right"));
+        std::fs::create_dir_all(left.join("dir")).unwrap();
+        std::fs::write(left.join("dir/inner"), "i").unwrap();
+        std::fs::write(left.join("a"), "a").unwrap();
+        std::fs::write(left.join("b"), "b").unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let app = App::new(left, right, Config::default());
+        (tmp, app)
+    }
+
+    #[test]
+    fn copy_marked_files_to_other_panel() {
+        let (tmp, mut app) = two_dirs();
+        // Порядок: dir/, a, b. Выделяем dir и b.
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.panel(Side::Left).marked.len(), 2);
+        press(&mut app, KeyCode::Char('c'));
+        finish(&mut app, KeyCode::Esc);
+
+        let right = tmp.path().join("right");
+        assert!(right.join("dir/inner").exists());
+        assert!(right.join("b").exists());
+        assert!(!right.join("a").exists());
+        // Панели перечитаны, выделение снято, итог в строке состояния.
+        assert_eq!(app.panel(Side::Right).entries.len(), 2);
+        assert!(app.panel(Side::Left).marked.is_empty());
+        let status = app.status.as_ref().unwrap();
+        assert!(!status.error);
+        assert!(status.text.contains("copied: 2"), "{}", status.text);
+    }
+
+    #[test]
+    fn move_without_marks_takes_item_under_cursor() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Down); // a
+        press(&mut app, KeyCode::Char('m'));
+        finish(&mut app, KeyCode::Esc);
+        assert!(!tmp.path().join("left/a").exists());
+        assert!(tmp.path().join("right/a").exists());
+        assert_eq!(app.panel(Side::Left).entries.len(), 2);
+    }
+
+    #[test]
+    fn conflict_is_answered_from_keyboard() {
+        let (tmp, mut app) = two_dirs();
+        std::fs::write(tmp.path().join("right/a"), "old").unwrap();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('c'));
+        finish(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("right/a")).unwrap(),
+            "old"
+        );
+        assert!(app.status.as_ref().unwrap().text.contains("skipped: 1"));
+
+        press(&mut app, KeyCode::Char('c'));
+        finish(&mut app, KeyCode::Char('r'));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("right/a")).unwrap(),
+            "a"
+        );
+    }
+
+    #[test]
+    fn transfer_needs_a_visible_distinct_panel() {
+        let (_tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Char('P'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.as_ref().unwrap().error);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f"), "").unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.as_ref().unwrap().text.contains("same directory"));
+    }
+
+    #[test]
+    fn delete_requires_repeated_key() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Down); // a
+        // Любая другая клавиша отменяет удаление.
+        press(&mut app, KeyCode::Char('D'));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete {
+                permanent: true,
+                ..
+            }
+        ));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(tmp.path().join("left/a").exists());
+
+        // Для безвозвратного удаления нужно именно `D`, а не `d`.
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(tmp.path().join("left/a").exists());
+
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('D'));
+        finish(&mut app, KeyCode::Esc);
+        assert!(!tmp.path().join("left/a").exists());
+        assert!(app.status.as_ref().unwrap().text.contains("deleted: 1"));
+    }
+
+    #[test]
+    fn panel_inside_deleted_directory_climbs_up() {
+        let (tmp, mut app) = two_dirs();
+        let dir = tmp.path().join("left/dir");
+        app.panel_mut(Side::Right).cd(dir.clone(), true).unwrap();
+        // Удаляем dir из левой панели безвозвратно.
+        press(&mut app, KeyCode::Char('D'));
+        press(&mut app, KeyCode::Char('D'));
+        finish(&mut app, KeyCode::Esc);
+        assert!(!dir.exists());
+        assert_eq!(app.panel(Side::Right).dir, tmp.path().join("left"));
     }
 }

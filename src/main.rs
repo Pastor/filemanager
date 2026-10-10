@@ -3,6 +3,7 @@
 mod config;
 mod i18n;
 mod listing;
+mod ops;
 mod panel;
 mod ui;
 
