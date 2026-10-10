@@ -1741,12 +1741,18 @@ fn is_ident_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$'
 }
 
+/// Конец имени, начинающегося на `from`. Первый символ поглощается, если он
+/// может начинать имя: `@` и `$` открывают аннотации и переменные, но внутри
+/// имени не встречаются — без этого разбор на `@Override` стоял бы на месте.
 fn ident_end(chars: &[char], from: usize) -> usize {
     let mut end = from;
+    if end < chars.len() && is_ident_start(chars[end]) {
+        end += 1;
+    }
     while end < chars.len() && is_ident_char(chars[end]) {
         end += 1;
     }
-    end.max(from)
+    end
 }
 
 /// Конец числового литерала: цифры, буквы систем счисления, разделители и
@@ -2138,5 +2144,76 @@ mod tests {
             let joined: String = mark(path, line).iter().map(|(_, t)| t.as_str()).collect();
             assert_eq!(joined, line, "{path}");
         }
+    }
+
+    /// Каждая строка из «трудных» символов размечается за конечное время и
+    /// без потерь — во всех грамматиках. Зависание разметчика вешает весь
+    /// просмотр, поэтому проверяем в отдельном потоке с ограничением времени.
+    #[test]
+    fn every_grammar_terminates_on_tricky_input() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let paths = [
+                "a.rs",
+                "a.c",
+                "a.go",
+                "A.java",
+                "a.js",
+                "a.swift",
+                "a.py",
+                "a.rb",
+                "a.php",
+                "a.sh",
+                "a.pl",
+                "a.lua",
+                "a.sql",
+                "a.css",
+                "a.json",
+                "a.yaml",
+                "a.toml",
+                "a.ini",
+                "Makefile",
+                "Dockerfile",
+                "a.s",
+                "a.md",
+                "a.diff",
+                "a.html",
+                "a.log",
+                ".gitignore",
+                "a.properties",
+                ".env",
+                "a.txt",
+            ];
+            let alphabet: Vec<char> = "@$_a1 .\"'`#/*-+=:<>!?[](){}\\\tя日\u{0301}"
+                .chars()
+                .collect();
+            let mut samples: Vec<String> = vec![
+                "@SpringBootApplication".into(),
+                "@Override public void x() {}".into(),
+                "user@host failed".into(),
+                "<div @click=\"x\">".into(),
+                "@".into(),
+                "a@".into(),
+            ];
+            for &a in &alphabet {
+                for &b in &alphabet {
+                    samples.push(format!("{a}{b}"));
+                    for &c in ['@', '"', '<', '/', '*'].iter() {
+                        samples.push(format!("{a}{b}{c}"));
+                    }
+                }
+            }
+            for path in paths {
+                let language = detect(Path::new(path), "");
+                let mut h = Highlighter::new(language);
+                for sample in &samples {
+                    let joined: String = h.line(sample).iter().map(|p| p.text.as_str()).collect();
+                    assert_eq!(&joined, sample, "{path}");
+                }
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("разметчик завис на одной из строк");
     }
 }

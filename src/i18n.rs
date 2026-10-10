@@ -240,6 +240,7 @@ pub struct Text {
     pub wrong_layout: &'static str,
     pub hint_show: &'static str,
     pub help_q: &'static str,
+    pub load_timeout: &'static str,
 }
 
 pub static EN: Text = Text {
@@ -428,6 +429,7 @@ pub static EN: Text = Text {
     wrong_layout: "this command is not available in the current keyboard layout — switch to English",
     hint_show: "show panel",
     help_q: "quit; in dialogs, preview and modes — same as Esc",
+    load_timeout: "the file could not be read in time",
 };
 
 pub static RU: Text = Text {
@@ -616,4 +618,5 @@ pub static RU: Text = Text {
     wrong_layout: "команда недоступна в текущей раскладке — переключитесь на английскую",
     hint_show: "показать панель",
     help_q: "выход; в диалогах, просмотре и режимах — как Esc",
+    load_timeout: "файл не удалось прочитать за отведённое время",
 };

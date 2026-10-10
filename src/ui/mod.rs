@@ -9,6 +9,7 @@ pub mod theme;
 mod viewer;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, never, select, tick, unbounded};
@@ -28,6 +29,9 @@ use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::large::Large;
 use crate::ui::theme::Theme;
 use crate::ui::viewer::{HSCROLL_STEP, Viewer};
+
+/// Сколько ждать загрузчик просмотра, прежде чем счесть его зависшим.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Сообщение в строке состояния. Живёт до следующего нажатия клавиши.
 pub struct Status {
@@ -98,6 +102,8 @@ pub struct App {
     pub save_config: bool,
     /// Панель просмотра, если открыта. Она занимает место одной из панелей.
     pub viewer: Option<Viewer>,
+    /// С какого момента просмотр ждёт загрузчик — чтобы не ждать вечно.
+    loading_since: Option<Instant>,
     /// Редактор на месте просмотра, если открыт.
     pub editor: Option<Editor>,
     /// Поиск в панели, если открыт.
@@ -138,6 +144,7 @@ impl App {
             save_config: true,
             viewer: None,
             editor: None,
+            loading_since: None,
             finder: None,
             large: None,
             loader: Loader::new(),
@@ -418,6 +425,7 @@ impl App {
             let query = finder.query.clone();
             if viewer.path.as_ref() != Some(&wanted.0) {
                 let request = self.loader.request(wanted.0.clone());
+                self.loading_since = Some(Instant::now());
                 if let Some(viewer) = &mut self.viewer {
                     viewer.show(wanted.0.clone(), request);
                 }
@@ -439,6 +447,7 @@ impl App {
             return;
         }
         let request = self.loader.request(target.clone());
+        self.loading_since = Some(Instant::now());
         if let Some(viewer) = &mut self.viewer {
             viewer.show(target, request);
         }
@@ -527,9 +536,50 @@ impl App {
 
     /// Результат загрузчика.
     fn on_preview_loaded(&mut self, request: u64, preview: Preview) -> bool {
-        self.viewer
+        let taken = self
+            .viewer
             .as_mut()
-            .is_some_and(|viewer| viewer.loaded(request, preview))
+            .is_some_and(|viewer| viewer.loaded(request, preview));
+        if taken {
+            self.loading_since = None;
+        }
+        taken
+    }
+
+    /// Просмотр ждёт загрузчик.
+    fn preview_pending(&self) -> bool {
+        self.viewer
+            .as_ref()
+            .is_some_and(|v| v.path.is_some() && v.content.is_none())
+    }
+
+    /// Загрузчик не ответил вовремя — значит, завис на этом файле. Поток не
+    /// остановить, поэтому он бросается, а вместо него запускается новый;
+    /// просмотр показывает ошибку, а не бесконечную «загрузку».
+    fn check_loader(&mut self) -> bool {
+        let stuck = self.preview_pending()
+            && self
+                .loading_since
+                .is_some_and(|t| t.elapsed() >= LOAD_TIMEOUT);
+        if !stuck {
+            return false;
+        }
+        self.loader = Loader::new();
+        self.loading_since = None;
+        let message = self.text().load_timeout.to_string();
+        if let Some(viewer) = &mut self.viewer
+            && let Some(path) = viewer.path.clone()
+        {
+            viewer.content = Some(Preview {
+                path,
+                size: 0,
+                modified: None,
+                mode: String::new(),
+                owner: String::new(),
+                body: Body::Error(message),
+            });
+        }
+        true
     }
 
     /// Клавиши панели просмотра.
@@ -1230,7 +1280,6 @@ fn summary(text: &Text, kind: JobKind, report: &Report) -> String {
 fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let events = spawn_events();
     // Канал загрузчика живёт столько же, сколько приложение.
-    let previews = app.loader.rx.clone();
     let mut dirty = true;
     loop {
         if dirty {
@@ -1252,7 +1301,11 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
             .unwrap_or_else(never);
         let scanned = app.large.as_ref().and_then(Large::rx).unwrap_or_else(never);
         // Пока идёт сканирование, счётчики на экране обновляются по таймеру.
-        let ticks = if app.large.as_ref().is_some_and(|l| l.tree.is_none()) {
+        // Загрузчик могли заменить — канал берётся каждый раз заново.
+        let previews = app.loader.rx.clone();
+        dirty |= app.check_loader();
+        let ticks = if app.large.as_ref().is_some_and(|l| l.tree.is_none()) || app.preview_pending()
+        {
             tick(std::time::Duration::from_millis(100))
         } else {
             never()
@@ -2134,5 +2187,45 @@ mod tests {
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Char('с'));
         assert_eq!(app.finder.as_ref().unwrap().query, "с");
+    }
+
+    #[test]
+    fn stuck_loader_is_replaced_and_reported() {
+        let (_tmp, mut app) = viewer_dir();
+        press(&mut app, KeyCode::Char('p'));
+        // Изображаем зависший загрузчик: ответа нет, а срок вышел.
+        app.loader = Loader::new();
+        app.loading_since = Some(Instant::now() - LOAD_TIMEOUT);
+        assert!(app.preview_pending());
+        assert!(app.check_loader());
+        let viewer = app.viewer.as_ref().unwrap();
+        assert!(matches!(
+            viewer.content.as_ref().map(|c| &c.body),
+            Some(Body::Error(_))
+        ));
+        assert!(!app.check_loader());
+
+        // Новый загрузчик работает: следующий файл грузится как обычно.
+        press(&mut app, KeyCode::Down);
+        wait_preview(&mut app);
+        assert!(app.viewer.as_ref().unwrap().content.is_some());
+    }
+
+    #[test]
+    fn java_annotations_preview_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("App.java"),
+            "@SpringBootApplication\npublic class App {\n    @Override\n    public String toString() { return \"x\"; }\n}\n",
+        )
+        .unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Enter);
+        wait_preview(&mut app);
+        let viewer = app.viewer.as_ref().unwrap();
+        let Some(Body::Text(text)) = viewer.content.as_ref().map(|c| &c.body) else {
+            panic!("ожидался текст");
+        };
+        assert_eq!(text.plain(0), "@SpringBootApplication");
     }
 }
