@@ -4,6 +4,11 @@
 //! колонках курсор, дойдя до низа одной колонки, переходит в верх следующей.
 //! Прокрутка поэтому идёт целыми колонками — `offset` кратен высоте. Одна
 //! колонка прокручивается построчно.
+//!
+//! Архив открывается как директория: он распаковывается во временную папку,
+//! и панель запоминает это «монтирование». В заголовке показывается путь
+//! через архив (`~/x/a.zip/src`), а при выходе из архива временная папка
+//! удаляется.
 
 use std::collections::HashSet;
 use std::io;
@@ -30,6 +35,27 @@ pub struct Panel {
     pub rows: usize,
     /// Имена выделенных элементов текущей директории.
     pub marked: HashSet<String>,
+    /// Открытые архивы, от внешнего к вложенному.
+    pub mounts: Vec<Mount>,
+}
+
+/// Архив, открытый как директория.
+#[derive(Debug, Clone)]
+pub struct Mount {
+    /// Файл архива.
+    pub archive: PathBuf,
+    /// Временная директория с его содержимым.
+    pub root: PathBuf,
+}
+
+/// Общая временная директория для распакованных архивов этого процесса.
+pub fn mount_base() -> PathBuf {
+    std::env::temp_dir().join(format!("fm-{}", std::process::id()))
+}
+
+/// Путь лежит внутри распакованного архива: изменения там не попадут в архив.
+pub fn in_archive(path: &Path) -> bool {
+    path.starts_with(mount_base())
 }
 
 impl Panel {
@@ -43,6 +69,7 @@ impl Panel {
             columns: clamp_columns(columns),
             rows: 1,
             marked: HashSet::new(),
+            mounts: Vec::new(),
         };
         panel.reload(show_hidden)?;
         Ok(panel)
@@ -58,6 +85,7 @@ impl Panel {
             columns: clamp_columns(columns),
             rows: 1,
             marked: HashSet::new(),
+            mounts: Vec::new(),
         }
     }
 
@@ -89,7 +117,52 @@ impl Panel {
         self.marked.clear();
         self.cursor = 0;
         self.offset = 0;
+        self.unmount_left();
         Ok(())
+    }
+
+    /// Входит в распакованный архив: `root` — его временная директория.
+    pub fn mount(&mut self, archive: PathBuf, root: PathBuf, show_hidden: bool) -> io::Result<()> {
+        self.mounts.push(Mount {
+            archive,
+            root: root.clone(),
+        });
+        if let Err(err) = self.cd(root, show_hidden) {
+            if let Some(mount) = self.mounts.pop() {
+                let _ = std::fs::remove_dir_all(mount.root);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Закрывает архивы, из которых панель ушла, и удаляет их временные папки.
+    fn unmount_left(&mut self) {
+        while let Some(mount) = self.mounts.last() {
+            if self.dir.starts_with(&mount.root) {
+                break;
+            }
+            let _ = std::fs::remove_dir_all(&mount.root);
+            self.mounts.pop();
+        }
+    }
+
+    /// Путь для показа: временные директории архивов заменены путями к архивам.
+    pub fn display_path(&self, path: &Path) -> PathBuf {
+        let mut path = path.to_path_buf();
+        // Изнутри наружу: путь во вложенном архиве сначала становится путём
+        // во внешнем, а тот — обычным путём.
+        for mount in self.mounts.iter().rev() {
+            if let Ok(rel) = path.strip_prefix(&mount.root) {
+                path = mount.archive.join(rel);
+            }
+        }
+        path
+    }
+
+    /// Текущая директория для показа.
+    pub fn display_dir(&self) -> PathBuf {
+        self.display_path(&self.dir)
     }
 
     /// Входит в директорию под курсором. `Ok(false)` — под курсором не директория.
@@ -108,13 +181,15 @@ impl Panel {
     /// Поднимается на уровень выше и ставит курсор на директорию, из которой
     /// вышли. `Ok(false)` — выше подниматься некуда.
     pub fn leave(&mut self, show_hidden: bool) -> io::Result<bool> {
-        let Some(parent) = self.dir.parent().map(Path::to_path_buf) else {
+        // Из корня архива выходим туда, где лежит сам архив.
+        let from = match self.mounts.last() {
+            Some(mount) if mount.root == self.dir => mount.archive.clone(),
+            _ => self.dir.clone(),
+        };
+        let Some(parent) = from.parent().map(Path::to_path_buf) else {
             return Ok(false);
         };
-        let came_from = self
-            .dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        let came_from = from.file_name().map(|n| n.to_string_lossy().into_owned());
         self.cd(parent, show_hidden)?;
         if let Some(name) = came_from {
             self.select_name(&name);
@@ -206,6 +281,15 @@ impl Panel {
             self.rows,
             self.columns as usize,
         );
+    }
+}
+
+impl Drop for Panel {
+    /// Временные папки архивов не должны пережить панель.
+    fn drop(&mut self) {
+        for mount in &self.mounts {
+            let _ = std::fs::remove_dir_all(&mount.root);
+        }
     }
 }
 
@@ -390,5 +474,58 @@ mod tests {
         panel.marked.insert("sub".into());
         panel.enter(true).unwrap();
         assert!(panel.marked.is_empty());
+    }
+
+    #[test]
+    fn mounted_archive_behaves_like_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("tmp-root");
+        fs::create_dir_all(home.join("x")).unwrap();
+        fs::write(home.join("a.zip"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "").unwrap();
+
+        let mut panel = Panel::open(home.clone(), 1, true).unwrap();
+        panel.mount(home.join("a.zip"), root.clone(), true).unwrap();
+        assert_eq!(panel.display_dir(), home.join("a.zip"));
+        panel.enter(true).unwrap();
+        assert_eq!(panel.display_dir(), home.join("a.zip/src"));
+
+        // Выход из корня архива — к самому архиву, временная папка удаляется.
+        panel.leave(true).unwrap();
+        assert!(root.exists());
+        panel.leave(true).unwrap();
+        assert_eq!(panel.dir, home);
+        assert_eq!(panel.current().unwrap().name, "a.zip");
+        assert!(panel.mounts.is_empty());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn jumping_out_of_archive_unmounts_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(&root).unwrap();
+        let mut panel = Panel::open(tmp.path().to_path_buf(), 1, true).unwrap();
+        panel
+            .mount(tmp.path().join("a.tar"), root.clone(), true)
+            .unwrap();
+        panel.cd(tmp.path().to_path_buf(), true).unwrap();
+        assert!(panel.mounts.is_empty());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn dropping_panel_removes_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(&root).unwrap();
+        let mut panel = Panel::open(tmp.path().to_path_buf(), 1, true).unwrap();
+        panel
+            .mount(tmp.path().join("a.tar"), root.clone(), true)
+            .unwrap();
+        drop(panel);
+        assert!(!root.exists());
     }
 }

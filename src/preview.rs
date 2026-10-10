@@ -77,6 +77,8 @@ pub enum Body {
     Dir(DirInfo),
     /// Строки hex-дампа начала файла.
     Binary(Vec<String>),
+    /// Содержимое архива.
+    Archive(Vec<crate::archive::Item>),
     /// Не удалось прочитать.
     Error(String),
 }
@@ -160,6 +162,12 @@ pub fn build(path: &Path, stale: &dyn Fn() -> bool) -> Preview {
 fn file_body(path: &Path, meta: &Metadata) -> Body {
     if !meta.is_file() {
         return Body::Binary(Vec::new());
+    }
+    if crate::archive::Format::detect(path).is_some() {
+        return match crate::archive::list(path) {
+            Ok(items) => Body::Archive(items),
+            Err(err) => Body::Error(err.to_string()),
+        };
     }
     let mut bytes = Vec::new();
     let read = File::open(path).and_then(|f| f.take(TEXT_LIMIT).read_to_end(&mut bytes));

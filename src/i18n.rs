@@ -160,6 +160,21 @@ pub struct Text {
     pub scanned: &'static str,
     pub type_to_search: &'static str,
     pub limit_reached: &'static str,
+
+    // Архивы.
+    pub hint_pack: &'static str,
+    pub hint_format: &'static str,
+    pub job_extract: &'static str,
+    pub job_pack: &'static str,
+    pub done_extract: &'static str,
+    pub done_pack: &'static str,
+    pub pack_title: &'static str,
+    pub pack_format: &'static str,
+    pub pack_name: &'static str,
+    pub create: &'static str,
+    pub archive: &'static str,
+    pub entries: &'static str,
+    pub archive_readonly: &'static str,
 }
 
 pub static EN: Text = Text {
@@ -282,6 +297,20 @@ pub static EN: Text = Text {
     scanned: "files scanned",
     type_to_search: "type to search",
     limit_reached: "limit reached",
+
+    hint_pack: "archive",
+    hint_format: "format",
+    job_extract: "Opening archive",
+    job_pack: "Packing",
+    done_extract: "extracted",
+    done_pack: "packed",
+    pack_title: "Create archive",
+    pack_format: "format",
+    pack_name: "name",
+    create: "create",
+    archive: "archive",
+    entries: "entries",
+    archive_readonly: "archives are read-only: changes are not packed back",
 };
 
 pub static RU: Text = Text {
@@ -404,4 +433,18 @@ pub static RU: Text = Text {
     scanned: "файлов просмотрено",
     type_to_search: "введите запрос",
     limit_reached: "достигнут предел",
+
+    hint_pack: "архив",
+    hint_format: "формат",
+    job_extract: "Открытие архива",
+    job_pack: "Архивирование",
+    done_extract: "распаковано",
+    done_pack: "заархивировано",
+    pack_title: "Создание архива",
+    pack_format: "формат",
+    pack_name: "имя",
+    create: "создать",
+    archive: "архив",
+    entries: "элементов",
+    archive_readonly: "архивы только для чтения: изменения в архив не попадут",
 };

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
+use crate::archive::{self, Format};
 use crate::config::Side;
 use crate::ops::{self, Choice, Control, Progress, Report, Transfer};
 
@@ -26,6 +27,9 @@ pub enum JobKind {
     Move,
     Trash,
     Delete,
+    /// Распаковка архива для входа в него.
+    Extract,
+    Pack,
 }
 
 /// Сообщение из фонового потока.
@@ -48,6 +52,9 @@ pub struct Job {
     pub conflict: Option<(PathBuf, Sender<Choice>)>,
     /// Пользователь попросил отмену, операция сворачивается.
     pub cancelling: bool,
+    /// Для распаковки: файл архива и временная директория, куда он
+    /// распаковывается, — панель войдёт в неё по завершении.
+    pub mount: Option<(PathBuf, PathBuf)>,
 }
 
 impl Job {
@@ -70,6 +77,23 @@ impl Job {
             JobKind::Delete
         };
         Self::spawn(kind, source, move |ctl| ops::delete(&paths, to_trash, ctl))
+    }
+
+    /// Распаковывает архив во временную директорию `root`.
+    pub fn extract(archive: PathBuf, root: PathBuf, source: Side) -> Self {
+        let (from, to) = (archive.clone(), root.clone());
+        let mut job = Self::spawn(JobKind::Extract, source, move |ctl| {
+            archive::extract(&from, &to, ctl)
+        });
+        job.mount = Some((archive, root));
+        job
+    }
+
+    /// Упаковывает `sources` в файл `dest`.
+    pub fn pack(format: Format, sources: Vec<PathBuf>, dest: PathBuf, source: Side) -> Self {
+        Self::spawn(JobKind::Pack, source, move |ctl| {
+            archive::pack(format, &sources, &dest, ctl)
+        })
     }
 
     fn spawn(
@@ -96,6 +120,7 @@ impl Job {
             progress: Progress::default(),
             conflict: None,
             cancelling: false,
+            mount: None,
         }
     }
 

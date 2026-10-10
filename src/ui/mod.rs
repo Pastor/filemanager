@@ -12,11 +12,12 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, never, select, unbounded};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::archive::Format;
 use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
 use crate::editor::{Editor, OpenError};
 use crate::i18n::Text;
 use crate::ops::{self, Choice, Problem, Report, Transfer};
-use crate::panel::Panel;
+use crate::panel::{Panel, in_archive, mount_base};
 use crate::preview::{Body, Loader, Preview};
 use crate::search::Kind as SearchKind;
 use crate::ui::finder::Finder;
@@ -46,6 +47,28 @@ pub enum Mode {
     EditorSave,
     /// Выход из редактора с несохранёнными изменениями.
     EditorExit,
+    /// Создание архива: выбор формата и имени.
+    Pack(PackForm),
+}
+
+/// Форма создания архива.
+pub struct PackForm {
+    /// Индекс в [`Format::PACKABLE`].
+    pub format: usize,
+    /// Имя архива без расширения.
+    pub name: String,
+    pub sources: Vec<PathBuf>,
+}
+
+impl PackForm {
+    pub fn format(&self) -> Format {
+        Format::PACKABLE[self.format]
+    }
+
+    /// Имя файла архива с расширением выбранного формата.
+    pub fn file_name(&self) -> String {
+        format!("{}.{}", self.name, self.format().extension())
+    }
 }
 
 /// Состояние приложения.
@@ -170,6 +193,7 @@ impl App {
             Mode::Job(_) => return self.on_job_key(key.code),
             Mode::EditorSave => return self.on_save_key(key.code),
             Mode::EditorExit => return self.on_exit_key(key.code),
+            Mode::Pack(_) => return self.on_pack_key(key.code),
         }
         // Редактор сам разбирает сочетания с Ctrl.
         if self.editor.is_some() {
@@ -211,6 +235,15 @@ impl App {
             }
             KeyCode::Home => self.active_panel().home(),
             KeyCode::End => self.active_panel().end(),
+            // Архив открывается как директория.
+            KeyCode::Right | KeyCode::Enter
+                if self
+                    .active_panel()
+                    .current()
+                    .is_some_and(|e| !e.kind.is_dir() && Format::detect(&e.path).is_some()) =>
+            {
+                self.open_archive();
+            }
             // Enter на файле открывает его в просмотре и переводит туда фокус.
             KeyCode::Enter
                 if self
@@ -278,6 +311,7 @@ impl App {
             KeyCode::Char('m') => self.start_transfer(Transfer::Move),
             KeyCode::Char('d') => self.ask_delete(!self.cfg.use_trash),
             KeyCode::Char('D') => self.ask_delete(true),
+            KeyCode::Char('a') => self.ask_pack(),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -498,6 +532,11 @@ impl App {
             return;
         }
         let (path, top) = (content.path.clone(), viewer.top);
+        if in_archive(&path) {
+            let text = self.text().archive_readonly;
+            self.fail(text);
+            return;
+        }
         match Editor::open(&path, self.cfg.indent as usize) {
             Ok(mut editor) => {
                 // Курсор там, где пользователь читал.
@@ -632,6 +671,11 @@ impl App {
             return;
         }
         let dest = self.panel(self.active.other()).dir.clone();
+        if in_archive(&dest) {
+            let text = self.text().archive_readonly;
+            self.fail(text);
+            return;
+        }
         if let Err(problem) = ops::check(&sources, &dest) {
             let text = self.text();
             self.fail(match problem {
@@ -700,9 +744,13 @@ impl App {
                 }
             }
             JobMsg::Done(report) => {
-                let (kind, source) = (job.kind, job.source);
+                let (kind, source, mount) = (job.kind, job.source, job.mount.take());
                 self.mode = Mode::Normal;
-                self.finish_job(kind, source, report);
+                if let Some((archive, root)) = mount {
+                    self.finish_extract(source, archive, root, report);
+                } else {
+                    self.finish_job(kind, source, report);
+                }
             }
         }
     }
@@ -711,10 +759,101 @@ impl App {
     fn on_job_lost(&mut self) {
         if let Mode::Job(job) = std::mem::replace(&mut self.mode, Mode::Normal) {
             self.panel_mut(job.source).marked.clear();
+            if let Some((_, root)) = job.mount {
+                let _ = std::fs::remove_dir_all(root);
+            }
         }
         self.refresh_panels();
         let text = self.text().job_lost;
         self.fail(text);
+    }
+
+    /// Распаковывает архив под курсором во временную директорию; панель
+    /// войдёт в неё, когда распаковка закончится.
+    fn open_archive(&mut self) {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let Some(archive) = self.active_panel().current().map(|e| e.path.clone()) else {
+            return;
+        };
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+        let root = mount_base().join(format!("{n}-{name}"));
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            self.fail_open(root, err);
+            return;
+        }
+        self.mode = Mode::Job(Job::extract(archive, root, self.active));
+    }
+
+    /// Итог распаковки: при успехе панель входит в архив, иначе временная
+    /// директория удаляется.
+    fn finish_extract(&mut self, side: Side, archive: PathBuf, root: PathBuf, report: Report) {
+        if report.done == 0 {
+            let _ = std::fs::remove_dir_all(&root);
+            let text = summary(self.text(), JobKind::Extract, &report);
+            if report.errors.is_empty() {
+                self.info(text);
+            } else {
+                self.fail(text);
+            }
+            return;
+        }
+        let show = self.cfg.show_hidden;
+        if let Err(err) = self.panel_mut(side).mount(archive, root.clone(), show) {
+            self.fail_open(root, err);
+        }
+    }
+
+    /// Открывает форму создания архива для выделенного или элемента под курсором.
+    fn ask_pack(&mut self) {
+        let panel = self.panel(self.active);
+        let sources = panel.targets();
+        if sources.is_empty() {
+            return;
+        }
+        if in_archive(&panel.dir) {
+            let text = self.text().archive_readonly;
+            self.fail(text);
+            return;
+        }
+        // Один элемент — архив по его имени, несколько — по имени директории.
+        let base = match sources.as_slice() {
+            [one] => one.file_name(),
+            _ => panel.dir.file_name(),
+        };
+        let name = base
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_string());
+        self.mode = Mode::Pack(PackForm {
+            format: 0,
+            name,
+            sources,
+        });
+    }
+
+    /// Клавиши формы архива: ←→ и Tab — формат, буквы — имя, Enter — создать.
+    fn on_pack_key(&mut self, code: KeyCode) {
+        let Mode::Pack(form) = &mut self.mode else {
+            return;
+        };
+        let n = Format::PACKABLE.len();
+        match code {
+            KeyCode::Left | KeyCode::BackTab => form.format = (form.format + n - 1) % n,
+            KeyCode::Right | KeyCode::Tab => form.format = (form.format + 1) % n,
+            KeyCode::Char(c) if c != '/' => form.name.push(c),
+            KeyCode::Backspace => {
+                form.name.pop();
+            }
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter if !form.name.trim().is_empty() => {
+                let Mode::Pack(form) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                    return;
+                };
+                let dest = self.panel(self.active).dir.join(form.file_name());
+                self.mode = Mode::Job(Job::pack(form.format(), form.sources, dest, self.active));
+            }
+            _ => {}
+        }
     }
 
     /// Обновляет панели после операции и сообщает итог.
@@ -821,6 +960,8 @@ pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<(
     let mut terminal = ratatui::init();
     let result = main_loop(&mut terminal, &mut app);
     ratatui::restore();
+    // Распакованные архивы живут только пока работает программа.
+    let _ = std::fs::remove_dir_all(mount_base());
     result?;
 
     if cfg_ok {
@@ -839,6 +980,8 @@ fn summary(text: &Text, kind: JobKind, report: &Report) -> String {
         JobKind::Move => text.done_move,
         JobKind::Trash => text.done_trash,
         JobKind::Delete => text.done_delete,
+        JobKind::Extract => text.done_extract,
+        JobKind::Pack => text.done_pack,
     };
     let mut parts = vec![format!("{verb}: {}", report.done)];
     if report.skipped > 0 {
@@ -1009,7 +1152,7 @@ mod tests {
     }
 
     /// Дожидается конца операции, отвечая на конфликты клавишей `answer`.
-    fn finish(app: &mut App, answer: KeyCode) {
+    pub(super) fn finish(app: &mut App, answer: KeyCode) {
         while let Mode::Job(job) = &app.mode {
             let msg = job.rx.recv().expect("операция должна прислать отчёт");
             app.on_job_msg(msg);
@@ -1478,5 +1621,108 @@ mod tests {
         assert_eq!(app.finder.as_ref().unwrap().query, "");
         press(&mut app, KeyCode::Esc);
         assert!(app.finder.is_none());
+    }
+
+    /// Директория с архивом `a.zip`, где лежат `docs/readme.txt` и `x.txt`.
+    fn with_zip() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("docs")).unwrap();
+        std::fs::write(src.join("docs/readme.txt"), "read").unwrap();
+        let left = tmp.path().join("left");
+        std::fs::create_dir_all(&left).unwrap();
+        let mut control = crate::archive::tests_support::Silent;
+        let report = crate::archive::pack(
+            Format::Zip,
+            &[src.join("docs")],
+            &left.join("a.zip"),
+            &mut control,
+        );
+        assert_eq!(report.done, 1);
+        std::fs::create_dir_all(tmp.path().join("right")).unwrap();
+        let app = App::new(left, tmp.path().join("right"), Config::default());
+        (tmp, app)
+    }
+
+    #[test]
+    fn archive_opens_like_directory_and_cleans_up() {
+        let (tmp, mut app) = with_zip();
+        press(&mut app, KeyCode::Enter);
+        finish(&mut app, KeyCode::Esc);
+        let panel = app.panel(Side::Left);
+        assert_eq!(panel.display_dir(), tmp.path().join("left/a.zip"));
+        assert_eq!(panel.current().unwrap().name, "docs");
+        let root = panel.mounts[0].root.clone();
+        assert!(root.starts_with(mount_base()));
+
+        // Внутрь архива копировать нельзя, из архива — можно.
+        std::fs::write(tmp.path().join("right/f.txt"), "").unwrap();
+        app.refresh_panels();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.as_ref().unwrap().text.contains("read-only"));
+        assert!(!root.join("f.txt").exists());
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('c'));
+        finish(&mut app, KeyCode::Esc);
+        assert!(tmp.path().join("right/docs/readme.txt").exists());
+
+        // Выход — курсор на архиве, временная папка удалена.
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.panel(Side::Left).dir, tmp.path().join("left"));
+        assert_eq!(app.panel(Side::Left).current().unwrap().name, "a.zip");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn broken_archive_reports_error_and_stays() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bad.zip"), "garbage").unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Right);
+        finish(&mut app, KeyCode::Esc);
+        assert_eq!(app.panel(Side::Left).dir, tmp.path());
+        assert!(app.panel(Side::Left).mounts.is_empty());
+        assert!(app.status.as_ref().unwrap().error);
+    }
+
+    #[test]
+    fn pack_marked_items_with_chosen_name() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Down); // a
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' ')); // a, b
+        press(&mut app, KeyCode::Char('a'));
+        let Mode::Pack(form) = &app.mode else {
+            panic!("ожидалась форма архива");
+        };
+        // Несколько элементов — имя по директории.
+        assert_eq!(form.file_name(), "left.zip");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_text(&mut app, "ab");
+        press(&mut app, KeyCode::Left); // по кругу на tar.zst
+        press(&mut app, KeyCode::Enter);
+        finish(&mut app, KeyCode::Esc);
+        let archive = tmp.path().join("left/ab.tar.zst");
+        let names: Vec<String> = crate::archive::list(&archive)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(app.status.as_ref().unwrap().text.contains("packed: 2"));
+    }
+
+    #[test]
+    fn pack_dialog_esc_cancels() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!tmp.path().join("left/dir.zip").exists());
     }
 }

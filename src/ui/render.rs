@@ -56,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Mode::Job(job) => draw_job(frame, main, job, &app.theme, app.text()),
         Mode::EditorSave | Mode::EditorExit => draw_save(frame, main, app),
+        Mode::Pack(form) => draw_pack(frame, main, form, &app.theme, app.text()),
     }
 }
 
@@ -80,7 +81,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
     let text = app.text();
 
     let title_width = (area.width as usize).saturating_sub(4);
-    let title = shorten_path(&display_path(&app.panel(side).dir), title_width);
+    let title = shorten_path(&display_path(&app.panel(side).display_dir()), title_width);
     let panel = app.panel(side);
     let counter = if panel.entries.is_empty() {
         String::new()
@@ -398,6 +399,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         ],
         Mode::EditorSave => vec![("y", t.save), ("Esc", t.cancel)],
         Mode::EditorExit => vec![("y", t.save), ("n", t.discard), ("Esc", t.keep_editing)],
+        Mode::Pack(_) => pack_hints(t),
         Mode::Normal if app.viewer_focused() => {
             let wrap = app.viewer.as_ref().is_some_and(|v| v.wrap);
             let mut hints = vec![("↑↓", t.hint_scroll)];
@@ -424,6 +426,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("c", t.hint_copy),
             ("m", t.hint_move_to),
             ("d", t.hint_delete),
+            ("a", t.hint_pack),
             ("P", t.hint_hide),
             ("<>", t.hint_width),
             ("1-3", t.hint_columns),
@@ -478,6 +481,10 @@ fn finder_line<'a>(finder: &Finder, width: usize, theme: &Theme, t: &'a Text) ->
 fn draw_finder(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = app.theme;
     let t = app.text();
+    let root = match &app.finder {
+        Some(f) => app.panels[f.side as usize].display_path(&f.root),
+        None => return,
+    };
     let Some(finder) = app.finder.as_mut() else {
         return;
     };
@@ -488,7 +495,7 @@ fn draw_finder(frame: &mut Frame, area: Rect, app: &mut App) {
     let title_width = (area.width as usize).saturating_sub(label.width() + 8);
     let title = format!(
         " {label}: {} ",
-        shorten_path(&display_path(&finder.root), title_width)
+        shorten_path(&display_path(&root), title_width)
     );
     let counter = if finder.hits.is_empty() {
         String::new()
@@ -699,6 +706,8 @@ fn draw_job(frame: &mut Frame, area: Rect, job: &Job, theme: &Theme, t: &'static
         JobKind::Move => t.job_move,
         JobKind::Trash => t.job_trash,
         JobKind::Delete => t.job_delete,
+        JobKind::Extract => t.job_extract,
+        JobKind::Pack => t.job_pack,
     };
     let p = &job.progress;
     let current = shorten_path(&display_path(&p.current), inner);
@@ -951,10 +960,15 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
     };
 
     let title_width = (area.width as usize).saturating_sub(4);
-    let title = viewer
+    let shown = viewer
         .path
         .as_ref()
-        .map(|p| shorten_path(&display_path(p), title_width))
+        .map(|p| app.panels[side.other() as usize].display_path(p));
+    let Some(viewer) = app.viewer.as_mut() else {
+        return;
+    };
+    let title = shown
+        .map(|p| shorten_path(&display_path(&p), title_width))
         .unwrap_or_default();
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -996,6 +1010,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
             let lines = match body {
                 Body::Dir(info) => dir_lines(content, info, width, &theme, t),
                 Body::Binary(dump) => binary_lines(dump, &theme, t),
+                Body::Archive(items) => archive_lines(items, &theme),
                 Body::Error(err) => vec![Line::styled(
                     format!("{}: {err}", t.cannot_read),
                     theme.error(),
@@ -1037,6 +1052,11 @@ fn viewer_info(viewer: &Viewer, t: &Text) -> String {
         }
         Body::Dir(_) => vec![t.info_directory.to_string()],
         Body::Binary(_) => vec![t.binary.to_string(), format_size(content.size)],
+        Body::Archive(items) => vec![
+            t.archive.to_string(),
+            format!("{} {}", items.len(), t.entries),
+            format_size(content.size),
+        ],
         Body::Error(_) => return String::new(),
     };
     format!(" {} ", parts.join(" · "))
@@ -1326,6 +1346,87 @@ fn dir_lines<'a>(
         ]));
     }
     lines
+}
+
+/// Содержимое архива: размер и путь, директории выделены.
+fn archive_lines<'a>(items: &[crate::archive::Item], theme: &Theme) -> Vec<Line<'a>> {
+    items
+        .iter()
+        .map(|item| {
+            let size = if item.is_dir {
+                String::new()
+            } else {
+                format_size(item.size)
+            };
+            let (style, suffix) = if item.is_dir {
+                (theme.dir(), "/")
+            } else {
+                (Style::default(), "")
+            };
+            Line::from(vec![
+                Span::styled(format!("{size:>9}  "), theme.dim()),
+                Span::styled(format!("{}{suffix}", item.name), style),
+            ])
+        })
+        .collect()
+}
+
+/// Клавиши формы архива.
+fn pack_hints(t: &'static Text) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("←→", t.hint_format),
+        ("Enter", t.create),
+        ("Esc", t.cancel),
+    ]
+}
+
+/// Форма создания архива: строка форматов и поле имени.
+fn draw_pack(
+    frame: &mut Frame,
+    area: Rect,
+    form: &crate::ui::PackForm,
+    theme: &Theme,
+    t: &'static Text,
+) {
+    let inner = dialog_inner(area);
+    let mut formats = vec![Span::styled(format!("{}: ", t.pack_format), theme.dim())];
+    for (i, format) in crate::archive::Format::PACKABLE.iter().enumerate() {
+        let label = format!(" {} ", format.extension());
+        formats.push(if i == form.format {
+            Span::styled(label, theme.cursor(true))
+        } else {
+            Span::raw(label)
+        });
+        formats.push(Span::raw(" "));
+    }
+    let name = fit(
+        &form.file_name(),
+        "",
+        inner.saturating_sub(t.pack_name.width() + 3),
+    );
+    let what = match form.sources.as_slice() {
+        [one] => one
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        many => format!("{}: {}", t.items, many.len()),
+    };
+    let body = vec![
+        Line::styled(what, theme.dim()),
+        Line::raw(""),
+        Line::from(formats),
+        Line::from(vec![
+            Span::styled(format!("{}: ", t.pack_name), theme.dim()),
+            Span::styled(
+                name,
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled("▏", theme.key()),
+        ]),
+        Line::raw(""),
+        hint_line(&pack_hints(t), inner, theme),
+    ];
+    dialog(frame, area, t.pack_title, body, theme.border(true), theme);
 }
 
 /// Hex-дамп: смещение приглушено, байты и символы обычным цветом.
@@ -1688,5 +1789,37 @@ mod tests {
         // Справа просмотр на найденной строке.
         assert!(all.contains("31 fn needle() {}"), "{all}");
         assert!(lines[11].contains("/ in files: needle"));
+    }
+
+    #[test]
+    fn frame_pack_dialog_and_archive_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("proj")).unwrap();
+        std::fs::write(tmp.path().join("proj/a.txt"), "hello").unwrap();
+        let mut app = App::new_for_test(tmp.path());
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        let lines = screen(&mut app, 100, 14);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("Create archive"));
+        assert!(all.contains("name: proj.tar.gz"));
+        assert!(lines[13].contains("←→ format"));
+
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        crate::ui::tests::finish(&mut app, KeyCode::Esc);
+        assert!(tmp.path().join("proj.tar.gz").exists());
+
+        // Просмотр архива — список его содержимого.
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Char('p')));
+        crate::ui::tests::wait_preview(&mut app);
+        let lines = screen(&mut app, 100, 14);
+        println!("{}", lines.join("\n"));
+        let all = lines.join("\n");
+        assert!(all.contains("proj/a.txt"), "{all}");
+        assert!(all.contains("archive · 2 entries"), "{all}");
     }
 }
