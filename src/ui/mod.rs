@@ -364,7 +364,7 @@ impl App {
                     None => Some(self.active.other()),
                 };
             }
-            KeyCode::Char(c @ '1'..='3') => {
+            KeyCode::Char(c @ '0'..='3') => {
                 let n = c as u8 - b'0';
                 self.active_panel().set_columns(n);
                 let text = format!("{}: {n}", self.text().columns);
@@ -1406,6 +1406,10 @@ mod tests {
         press(&mut app, KeyCode::Char('3'));
         assert_eq!(app.panel(Side::Left).columns, 3);
         assert_eq!(app.panel(Side::Right).columns, 1);
+        press(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.panel(Side::Left).columns, 0);
+        assert_eq!(app.panel(Side::Left).layout_columns(), 1);
+        assert!(!app.panel(Side::Left).details());
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
                 ("Tab", t.hint_panel),
                 ("<  >", t.hint_width),
                 ("P", t.hint_hide),
-                ("1 2 3", t.hint_columns),
+                ("0 1 2 3", t.hint_columns),
                 ("Shift+←→", t.help_columns_move),
                 (".", t.hint_hidden),
             ],

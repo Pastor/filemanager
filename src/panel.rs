@@ -29,7 +29,7 @@ pub struct Panel {
     pub cursor: usize,
     /// Индекс первого видимого элемента.
     pub offset: usize,
-    /// Число колонок.
+    /// Число колонок; 0 — одна колонка без размера и даты.
     pub columns: u8,
     /// Высота колонки на последнем кадре — шаг для PageUp/PageDown.
     pub rows: usize,
@@ -279,6 +279,16 @@ impl Panel {
         self.columns = clamp_columns(n);
     }
 
+    /// Сколько колонок занимает раскладка: режим 0 — это тоже одна колонка.
+    pub fn layout_columns(&self) -> usize {
+        self.columns.max(1) as usize
+    }
+
+    /// Показывать ли справа размер и дату.
+    pub fn details(&self) -> bool {
+        self.columns == 1
+    }
+
     fn clamp_cursor(&mut self) {
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
     }
@@ -292,7 +302,7 @@ impl Panel {
             self.cursor,
             self.entries.len(),
             self.rows,
-            self.columns as usize,
+            self.layout_columns(),
         );
     }
 }

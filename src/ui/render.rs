@@ -128,7 +128,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
     let rows = inner.height as usize;
     panel.fit(rows);
     let panel = app.panel(side);
-    let columns = panel.columns as usize;
+    let columns = panel.layout_columns();
 
     // Колонки равной ширины, разделённые вертикальной чертой.
     let mut constraints = Vec::with_capacity(columns * 2);
@@ -157,7 +157,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
             .map(|(i, entry)| {
                 let cursor = (i == panel.cursor).then_some(active);
                 let look = Look {
-                    details: columns == 1,
+                    details: panel.details(),
                     cursor,
                     marked: panel.is_marked(entry),
                 };
@@ -503,7 +503,7 @@ fn files_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     if two {
         hints.push(("<>", t.hint_width));
     }
-    hints.push(("1-3", t.hint_columns));
+    hints.push(("0-3", t.hint_columns));
     hints.push((".", t.hint_hidden));
     hints.push(("o", t.hint_settings));
     hints.push(("q", t.hint_quit));

@@ -185,9 +185,10 @@ pub fn clamp_left_pct(pct: u16) -> u16 {
     pct.clamp(LEFT_PCT_MIN, LEFT_PCT_MAX)
 }
 
-/// Приводит число колонок к диапазону `1..=MAX_COLUMNS`.
+/// Приводит число колонок к диапазону `0..=MAX_COLUMNS`; 0 — одна колонка
+/// без размера и даты.
 pub fn clamp_columns(n: u8) -> u8 {
-    n.clamp(1, MAX_COLUMNS)
+    n.min(MAX_COLUMNS)
 }
 
 #[cfg(test)]
@@ -235,7 +236,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.indent, 1);
         assert_eq!(cfg.session.left_pct, LEFT_PCT_MAX);
-        assert_eq!(cfg.session.left_columns, 1);
+        assert_eq!(cfg.session.left_columns, 0);
         assert_eq!(cfg.session.right_columns, MAX_COLUMNS);
     }
 
