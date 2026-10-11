@@ -37,6 +37,11 @@ pub struct Panel {
     pub marked: HashSet<String>,
     /// Открытые архивы, от внешнего к вложенному.
     pub mounts: Vec<Mount>,
+    /// Номер чтения директории: растёт при каждом `reload` и `cd`, чтобы
+    /// опоздавший ответ git о прежнем содержимом можно было отбросить.
+    pub generation: u64,
+    /// Имена элементов с незакоммиченными изменениями в git.
+    pub vcs_dirty: HashSet<String>,
 }
 
 /// Архив, открытый как директория.
@@ -70,6 +75,8 @@ impl Panel {
             rows: 1,
             marked: HashSet::new(),
             mounts: Vec::new(),
+            generation: 0,
+            vcs_dirty: HashSet::new(),
         };
         panel.reload(show_hidden)?;
         Ok(panel)
@@ -86,6 +93,8 @@ impl Panel {
             rows: 1,
             marked: HashSet::new(),
             mounts: Vec::new(),
+            generation: 0,
+            vcs_dirty: HashSet::new(),
         }
     }
 
@@ -98,6 +107,8 @@ impl Panel {
     pub fn reload(&mut self, show_hidden: bool) -> io::Result<()> {
         let keep = self.current().map(|e| e.name.clone());
         self.entries = listing::read_dir(&self.dir, show_hidden)?;
+        // Прежняя подсветка git остаётся до нового ответа, чтобы не мигать.
+        self.generation += 1;
         // Выделение исчезнувших (или спрятанных) элементов теряет смысл.
         let names: HashSet<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
         self.marked.retain(|name| names.contains(name.as_str()));
@@ -115,6 +126,8 @@ impl Panel {
         self.dir = dir;
         self.entries = entries;
         self.marked.clear();
+        self.vcs_dirty.clear();
+        self.generation += 1;
         self.cursor = 0;
         self.offset = 0;
         self.unmount_left();
@@ -224,6 +237,11 @@ impl Panel {
     /// Элемент выделен.
     pub fn is_marked(&self, entry: &Entry) -> bool {
         self.marked.contains(&entry.name)
+    }
+
+    /// У элемента есть незакоммиченные изменения в git.
+    pub fn is_vcs_dirty(&self, entry: &Entry) -> bool {
+        self.vcs_dirty.contains(&entry.name)
     }
 
     /// Пути, к которым применяется операция: выделенные элементы в порядке

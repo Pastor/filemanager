@@ -60,6 +60,8 @@ struct Palette {
     link: Rgb,
     /// Ошибки и битые ссылки.
     error: Rgb,
+    /// Незакоммиченные изменения в git: оранжевый.
+    vcs: Rgb,
     /// Курсор в активной панели: фон и текст.
     cursor_bg: Rgb,
     cursor_fg: Rgb,
@@ -79,6 +81,7 @@ const DARK: Palette = Palette {
     exec: (0x74, 0xC4, 0x76),
     link: (0x5A, 0xA9, 0xE6),
     error: (0xE0, 0x6C, 0x6C),
+    vcs: (0xE8, 0x93, 0x3A),
     cursor_bg: (0x2F, 0x4A, 0x6B),
     cursor_fg: (0xFF, 0xFF, 0xFF),
     cursor_idle_bg: (0x33, 0x36, 0x3C),
@@ -108,6 +111,7 @@ const LIGHT: Palette = Palette {
     exec: (0x1A, 0x7F, 0x37),
     link: (0x05, 0x50, 0xAE),
     error: (0xCF, 0x22, 0x2E),
+    vcs: (0xC2, 0x5E, 0x00),
     cursor_bg: (0xC8, 0xDD, 0xF5),
     cursor_fg: (0x10, 0x14, 0x18),
     cursor_idle_bg: (0xE6, 0xE6, 0xE3),
@@ -137,6 +141,7 @@ const GRUVBOX: Palette = Palette {
     exec: (0xB8, 0xBB, 0x26),
     link: (0x83, 0xA5, 0x98),
     error: (0xFB, 0x49, 0x34),
+    vcs: (0xD6, 0x5D, 0x0E),
     cursor_bg: (0x50, 0x49, 0x45),
     cursor_fg: (0xFB, 0xF1, 0xC7),
     cursor_idle_bg: (0x3C, 0x38, 0x36),
@@ -166,6 +171,7 @@ const SOLARIZED: Palette = Palette {
     exec: (0x85, 0x99, 0x00),
     link: (0x26, 0x8B, 0xD2),
     error: (0xDC, 0x32, 0x2F),
+    vcs: (0xE0, 0x7B, 0x39),
     cursor_bg: (0x0B, 0x4F, 0x63),
     cursor_fg: (0xEE, 0xE8, 0xD5),
     cursor_idle_bg: (0x07, 0x36, 0x42),
@@ -195,6 +201,7 @@ const NORD: Palette = Palette {
     exec: (0xA3, 0xBE, 0x8C),
     link: (0x81, 0xA1, 0xC1),
     error: (0xBF, 0x61, 0x6A),
+    vcs: (0xD0, 0x87, 0x70),
     cursor_bg: (0x43, 0x4C, 0x5E),
     cursor_fg: (0xEC, 0xEF, 0xF4),
     cursor_idle_bg: (0x3B, 0x42, 0x52),
@@ -346,6 +353,11 @@ impl Theme {
         Style::default()
             .fg(self.rgb(self.palette().error))
             .add_modifier(Modifier::CROSSED_OUT)
+    }
+
+    /// Имя элемента с незакоммиченными изменениями в git.
+    pub fn vcs_dirty(&self) -> Style {
+        Style::default().fg(self.rgb(self.palette().vcs))
     }
 
     /// Строка под курсором; в неактивной панели курсор приглушён.

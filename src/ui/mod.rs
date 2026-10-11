@@ -18,6 +18,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use crate::archive::Format;
 use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
 use crate::editor::{Editor, OpenError};
+use crate::git;
 use crate::i18n::Text;
 use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::{Panel, in_archive, mount_base};
@@ -111,6 +112,11 @@ pub struct App {
     /// Режим «большие объекты», если открыт.
     pub large: Option<Large>,
     loader: Loader,
+    /// Канал ответов git о незакоммиченных изменениях в панелях.
+    git_tx: Sender<git::Reply<Side>>,
+    git_rx: Receiver<git::Reply<Side>>,
+    /// Для какого чтения директории каждой панели статус уже запрошен.
+    git_asked: [u64; 2],
     pub quit: bool,
 }
 
@@ -132,6 +138,7 @@ impl App {
             open(left, session.left_columns),
             open(right, session.right_columns),
         ];
+        let (git_tx, git_rx) = unbounded();
         Self {
             panels,
             active: Side::Left,
@@ -148,6 +155,9 @@ impl App {
             finder: None,
             large: None,
             loader: Loader::new(),
+            git_tx,
+            git_rx,
+            git_asked: [0; 2],
             quit: false,
         }
     }
@@ -1137,6 +1147,44 @@ impl App {
         }
     }
 
+    /// Запрашивает статус git для панелей, директорию которых перечитали
+    /// после прошлого запроса. Внутри распакованного архива git не нужен.
+    fn request_git(&mut self) {
+        for side in [Side::Left, Side::Right] {
+            let panel = &self.panels[side as usize];
+            if self.git_asked[side as usize] == panel.generation {
+                continue;
+            }
+            self.git_asked[side as usize] = panel.generation;
+            if in_archive(&panel.dir) {
+                continue;
+            }
+            let dirs = panel
+                .entries
+                .iter()
+                .filter(|e| e.kind.is_dir())
+                .map(|e| e.name.clone())
+                .collect();
+            git::spawn(
+                side,
+                panel.generation,
+                panel.dir.clone(),
+                dirs,
+                self.git_tx.clone(),
+            );
+        }
+    }
+
+    /// Применяет ответ git, если панель с тех пор не перечитывали.
+    fn on_git_reply(&mut self, reply: git::Reply<Side>) -> bool {
+        let panel = self.panel_mut(reply.key);
+        if panel.generation != reply.generation || panel.vcs_dirty == reply.dirty {
+            return false;
+        }
+        panel.vcs_dirty = reply.dirty;
+        true
+    }
+
     /// Перечитывает обе панели. Если директория панели исчезла (её удалили
     /// или перенесли), панель поднимается до ближайшего существующего предка.
     fn refresh_panels(&mut self) {
@@ -1322,6 +1370,8 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
         // Загрузчик могли заменить — канал берётся каждый раз заново.
         let previews = app.loader.rx.clone();
         dirty |= app.check_loader();
+        app.request_git();
+        let git_replies = app.git_rx.clone();
         let ticks = if app.large.as_ref().is_some_and(|l| l.tree.is_none()) || app.preview_pending()
         {
             tick(std::time::Duration::from_millis(100))
@@ -1348,6 +1398,11 @@ fn main_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<(
                     Err(_) => app.on_job_lost(),
                 }
                 dirty = true;
+            }
+            recv(git_replies) -> reply => {
+                if let Ok(reply) = reply {
+                    dirty |= app.on_git_reply(reply);
+                }
             }
             recv(previews) -> loaded => {
                 if let Ok((request, preview)) = loaded {

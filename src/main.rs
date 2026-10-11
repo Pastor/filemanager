@@ -3,6 +3,7 @@
 mod archive;
 mod config;
 mod editor;
+mod git;
 mod highlight;
 mod i18n;
 mod indent;

@@ -160,6 +160,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, app: &mut App, side: Side) {
                     details: panel.details(),
                     cursor,
                     marked: panel.is_marked(entry),
+                    vcs_dirty: panel.is_vcs_dirty(entry),
                 };
                 entry_line(entry, rect.width as usize, look, &theme, text)
             })
@@ -176,6 +177,8 @@ struct Look {
     /// `Some(активна ли панель)`, если на элементе стоит курсор.
     cursor: Option<bool>,
     marked: bool,
+    /// Есть незакоммиченные изменения в git.
+    vcs_dirty: bool,
 }
 
 /// Строка одного элемента шириной ровно `width`.
@@ -184,6 +187,7 @@ fn entry_line<'a>(entry: &Entry, width: usize, look: Look, theme: &Theme, text: 
         details,
         cursor,
         marked,
+        vcs_dirty,
     } = look;
     // Первая позиция — отметка выделения.
     let prefix = if marked { "*" } else { " " };
@@ -225,7 +229,13 @@ fn entry_line<'a>(entry: &Entry, width: usize, look: Look, theme: &Theme, text: 
     let (name_style, right_style) = if marked {
         (theme.marked(), theme.marked())
     } else {
-        (name_style(entry, theme), theme.dim())
+        let style = name_style(entry, theme);
+        let style = if vcs_dirty {
+            style.patch(theme.vcs_dirty())
+        } else {
+            style
+        };
+        (style, theme.dim())
     };
     let mut spans = vec![
         Span::styled(prefix, theme.marked()),
@@ -1841,6 +1851,7 @@ mod tests {
                     details,
                     cursor: Some(true),
                     marked: details,
+                    vcs_dirty: false,
                 };
                 let line = entry_line(&entry, width, look, &theme, crate::i18n::Lang::En.text());
                 assert_eq!(
