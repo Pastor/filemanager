@@ -937,6 +937,15 @@ impl App {
             KeyCode::Left => {
                 large.leave();
             }
+            // Удаляется объект под курсором; подтверждение — как в панелях.
+            KeyCode::Char(c @ ('d' | 'D')) => {
+                if let Some(path) = large.selected_path() {
+                    self.mode = Mode::ConfirmDelete {
+                        permanent: c == 'D' || !self.cfg.use_trash,
+                        targets: vec![path],
+                    };
+                }
+            }
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Esc | KeyCode::Char('q') => {
                 let Some(large) = self.large.take() else {
@@ -1111,6 +1120,15 @@ impl App {
     fn finish_job(&mut self, kind: JobKind, source: Side, report: Report) {
         self.panel_mut(source).marked.clear();
         self.refresh_panels();
+        // Удаление из режима «большие объекты»: исчезнувший объект убирается
+        // из дерева без повторного сканирования.
+        if let Some(large) = &mut self.large
+            && large
+                .selected_path()
+                .is_some_and(|path| std::fs::symlink_metadata(path).is_err())
+        {
+            large.remove_selected();
+        }
         let text = summary(self.text(), kind, &report);
         if report.errors.is_empty() {
             self.info(text);
@@ -1572,6 +1590,33 @@ mod tests {
         finish(&mut app, KeyCode::Esc);
         assert!(!tmp.path().join("left/a").exists());
         assert!(app.status.as_ref().unwrap().text.contains("deleted: 1"));
+    }
+
+    #[test]
+    fn delete_in_large_mode_updates_tree() {
+        let (tmp, mut app) = two_dirs();
+        press(&mut app, KeyCode::Char('l'));
+        let rx = app.large.as_ref().unwrap().rx().unwrap();
+        let tree = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        app.large.as_mut().unwrap().scanned(tree);
+        let target = app.large.as_ref().unwrap().selected_path().unwrap();
+        let count = app.large.as_ref().unwrap().order.len();
+
+        press(&mut app, KeyCode::Char('D'));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete {
+                permanent: true,
+                ..
+            }
+        ));
+        press(&mut app, KeyCode::Char('D'));
+        finish(&mut app, KeyCode::Esc);
+        assert!(!target.exists());
+        let large = app.large.as_ref().expect("режим остаётся открытым");
+        assert_eq!(large.order.len(), count - 1);
+        assert!(app.status.as_ref().unwrap().text.contains("deleted: 1"));
+        assert!(tmp.path().exists());
     }
 
     #[test]

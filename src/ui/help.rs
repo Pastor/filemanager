@@ -73,6 +73,8 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
             vec![
                 ("l", t.help_large),
                 ("→←", t.hint_in_out),
+                ("d", t.help_trash),
+                ("D", t.help_delete),
                 ("Esc", t.help_large_esc),
             ],
         ),

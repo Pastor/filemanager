@@ -551,6 +551,7 @@ fn large_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.large.as_ref().is_some_and(|l| !l.order.is_empty()) {
         hints.push(("↑↓", t.hint_move));
         hints.push(("→←", t.hint_in_out));
+        hints.push(("d", t.hint_delete));
     }
     hints.push(("Esc q", t.hint_exit));
     hints

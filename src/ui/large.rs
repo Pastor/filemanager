@@ -97,6 +97,37 @@ impl Large {
         self.current().map(|node| &node.children[i])
     }
 
+    /// Полный путь объекта под курсором.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        self.selected()
+            .map(|node| self.current_path().join(&*node.name))
+    }
+
+    /// Убирает из дерева объект под курсором (после удаления с диска):
+    /// его размер и число объектов вычитаются из всех предков.
+    pub fn remove_selected(&mut self) {
+        let Some(&i) = self.order.get(self.cursor) else {
+            return;
+        };
+        let Some((size, items)) = self.selected().map(|n| (n.size, n.items + 1)) else {
+            return;
+        };
+        let Some(mut node) = self.tree.as_mut() else {
+            return;
+        };
+        let mut levels = self.stack.iter();
+        loop {
+            node.size = node.size.saturating_sub(size);
+            node.items = node.items.saturating_sub(items);
+            match levels.next() {
+                Some(&j) => node = &mut node.children[j],
+                None => break,
+            }
+        }
+        node.children.remove(i);
+        self.rebuild();
+    }
+
     /// Пересобирает порядок текущего уровня: по размеру, при равенстве — по имени.
     fn rebuild(&mut self) {
         let Some(node) = self.current() else {
@@ -222,5 +253,26 @@ mod tests {
         assert_eq!(large.current_path(), root);
         assert_eq!(large.selected().unwrap().display_name(), "big");
         assert!(!large.leave());
+    }
+
+    #[test]
+    fn removed_node_is_subtracted_from_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("big/inner")).unwrap();
+        fs::write(root.join("big/inner/blob"), vec![0u8; 5000]).unwrap();
+        fs::write(root.join("big/small"), vec![0u8; 10]).unwrap();
+        fs::write(root.join("mid"), vec![0u8; 1000]).unwrap();
+
+        let mut large = scanned(root.to_path_buf());
+        let items = large.current().unwrap().items;
+        assert!(large.enter());
+        assert_eq!(large.selected_path().unwrap(), root.join("big/inner"));
+        large.remove_selected();
+        assert_eq!(large.current().unwrap().size, 10);
+        assert_eq!(large.selected().unwrap().display_name(), "small");
+        assert!(large.leave());
+        assert_eq!(large.current().unwrap().size, 1010);
+        assert_eq!(large.current().unwrap().items, items - 2);
     }
 }
