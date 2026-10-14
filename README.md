@@ -1,4 +1,8 @@
-# Janus
+<p align="center">
+  <img src="docs/mascot/svg/janus-owl-scene.svg" alt="Janus" width="420">
+</p>
+
+<h1 align="center">Janus</h1>
 
 **English** · [Русский](README.ru.md)
 
@@ -27,6 +31,7 @@ the keyboard, with every long operation running in the background.
 - [Themes](#themes)
 - [Command line](#command-line)
 - [Keyboard reference](#keyboard-reference)
+- [Mascot](#mascot)
 
 ## Features at a glance
 
@@ -366,6 +371,18 @@ input it is just a letter.
 `e` edit, `Esc` close.
 **Editor:** `Ctrl+S` save, `Esc` close, `Tab` / `Shift+Tab` indent,
 `Home`, `Ctrl+Home` / `Ctrl+End`.
+
+## Mascot
+
+<img src="docs/mascot/svg/janus-owl.svg" alt="Janus owl" width="160" align="right">
+
+Janus's mascot is a little owl whose facial disc is made of two "panels": the
+**right eye is open** — that's the active panel; the **left eye is asleep** while
+copying, search or size counting runs in the background. It sees everything,
+even when half of it is asleep.
+
+SVG and PNG versions (including favicon sizes) and the usage guide live in
+[docs/mascot](docs/mascot/README.md). Distributed under the project's MIT license.
 
 ## License
 
