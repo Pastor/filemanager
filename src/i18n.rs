@@ -195,6 +195,20 @@ pub struct Text {
     pub objects: &'static str,
     pub denied: &'static str,
 
+    // Выбор диска.
+    pub hint_drives: &'static str,
+    pub help_drives: &'static str,
+    pub drives_title: &'static str,
+    pub drive_fixed: &'static str,
+    pub drive_removable: &'static str,
+    pub drive_network: &'static str,
+    pub drive_optical: &'static str,
+    pub drive_home: &'static str,
+    pub drive_other: &'static str,
+    /// «свободно из»: `120G free of 476G`.
+    pub free_of: &'static str,
+    pub no_drives: &'static str,
+
     // Справка и настройки.
     pub hint_help: &'static str,
     pub hint_settings: &'static str,
@@ -385,6 +399,18 @@ pub static EN: Text = Text {
     objects: "objects",
     denied: "no access",
 
+    hint_drives: "drives",
+    help_drives: "choose a drive or volume; ← at the root does the same",
+    drives_title: "Drives",
+    drive_fixed: "disk",
+    drive_removable: "removable",
+    drive_network: "network",
+    drive_optical: "CD/DVD",
+    drive_home: "home",
+    drive_other: "other",
+    free_of: "free of",
+    no_drives: "no drives found",
+
     hint_help: "help",
     hint_settings: "settings",
     hint_change: "change",
@@ -573,6 +599,18 @@ pub static RU: Text = Text {
     dirs_scanned: "дир.",
     objects: "объектов",
     denied: "нет доступа",
+
+    hint_drives: "диски",
+    help_drives: "выбор диска или тома; ← в корне — то же",
+    drives_title: "Диски",
+    drive_fixed: "диск",
+    drive_removable: "съёмный",
+    drive_network: "сетевой",
+    drive_optical: "CD/DVD",
+    drive_home: "домашняя",
+    drive_other: "другой",
+    free_of: "свободно из",
+    no_drives: "диски не найдены",
 
     hint_help: "справка",
     hint_settings: "настройки",

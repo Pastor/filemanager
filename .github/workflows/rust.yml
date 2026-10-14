@@ -20,3 +20,16 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # Windows: проверяем, что собирается вместе с тестами (выбор диска и
+  # прочий код под cfg(windows) на Linux не компилируется).
+  windows:
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --verbose
+    - name: Build tests
+      run: cargo test --no-run --verbose

@@ -223,6 +223,8 @@ mod tests {
             names,
             ["link", "zdir", ".hidden", "a.txt", "broken", "run.sh"]
         );
+        #[cfg(not(unix))]
+        assert_eq!(names, ["zdir", ".hidden", "a.txt"]);
 
         let find = |n: &str| all.iter().find(|e| e.name == n).unwrap();
         assert_eq!(find("zdir").kind, Kind::Dir);

@@ -602,29 +602,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fmgr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "crossbeam-channel",
- "dirs",
- "flate2",
- "parking_lot",
- "ratatui",
- "rayon",
- "serde",
- "tar",
- "tempfile",
- "toml",
- "trash",
- "unicode-width",
- "zip",
- "zstd",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -809,6 +786,30 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "janus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossbeam-channel",
+ "dirs",
+ "flate2",
+ "libc",
+ "parking_lot",
+ "ratatui",
+ "rayon",
+ "serde",
+ "tar",
+ "tempfile",
+ "toml",
+ "trash",
+ "unicode-width",
+ "zip",
+ "zstd",
+]
 
 [[package]]
 name = "jobserver"

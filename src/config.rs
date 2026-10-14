@@ -1,6 +1,6 @@
 //! Конфигурация: настройки пользователя и состояние сессии в одном TOML-файле.
 //!
-//! Файл лежит в `~/.config/fmgr/config.toml` на всех платформах. `dirs::config_dir`
+//! Файл лежит в `~/.config/janus/config.toml` на всех платформах. `dirs::config_dir`
 //! на macOS указывает в `~/Library/Application Support`, где консольные утилиты
 //! никто не ищет, поэтому путь строится от домашней директории явно.
 
@@ -116,15 +116,22 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Путь к файлу конфигурации: `~/.config/fmgr/config.toml`.
+    /// Путь к файлу конфигурации: `~/.config/janus/config.toml`.
     pub fn path() -> Option<PathBuf> {
         dirs::home_dir().map(|d| d.join(".config").join(APP).join("config.toml"))
     }
 
-    /// Где лежал конфиг, пока программа называлась `fm`. Имя пришлось
-    /// сменить: в macOS 27 появилась системная `/usr/bin/fm`.
-    fn legacy_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|d| d.join(".config").join("fm").join("config.toml"))
+    /// Где лежал конфиг под прежними именами программы, от свежего к старому:
+    /// `fmgr`, а до него `fm` (имя пришлось сменить — в macOS 27 появилась
+    /// системная `/usr/bin/fm`).
+    fn legacy_paths() -> Vec<PathBuf> {
+        let Some(home) = dirs::home_dir() else {
+            return Vec::new();
+        };
+        ["fmgr", "fm"]
+            .iter()
+            .map(|name| home.join(".config").join(name).join("config.toml"))
+            .collect()
     }
 
     /// Загружает конфиг; отсутствие файла — не ошибка, берутся значения по умолчанию.
@@ -132,7 +139,9 @@ impl Config {
         let Some(path) = Self::path() else {
             return Ok(Self::default());
         };
-        if let Some(legacy) = Self::legacy_path() {
+        // Берётся первый найденный: после копирования `path` уже есть,
+        // и остальные `migrate` пропускает.
+        for legacy in Self::legacy_paths() {
             migrate(&legacy, &path);
         }
         if !path.exists() {
@@ -165,7 +174,7 @@ impl Config {
 }
 
 /// Имя программы: команда запуска и папка настроек.
-pub const APP: &str = "fmgr";
+pub const APP: &str = "janus";
 
 /// Переносит конфиг со старого места, если на новом его ещё нет. Старый файл
 /// не удаляется — копия безопаснее переноса, а мешать он не будет.
@@ -244,7 +253,7 @@ mod tests {
     fn legacy_config_is_copied_once() {
         let tmp = tempfile::tempdir().unwrap();
         let legacy = tmp.path().join("fm/config.toml");
-        let path = tmp.path().join("fmgr/config.toml");
+        let path = tmp.path().join("janus/config.toml");
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, "lang = \"ru\"").unwrap();
 

@@ -22,6 +22,7 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
                 ("0 1 2 3", t.hint_columns),
                 ("Shift+←→", t.help_columns_move),
                 (".", t.hint_hidden),
+                ("g", t.help_drives),
             ],
         ),
         (

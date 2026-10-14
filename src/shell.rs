@@ -4,7 +4,7 @@
 //! Процесс не может сменить текущую директорию родительской оболочки, поэтому
 //! программа записывает директорию в файл (`--cwd-file`), а функция оболочки
 //! читает его и делает `cd`. Подключается строкой в файле настроек оболочки:
-//! `eval "$(fmgr --shell-init zsh)"`.
+//! `eval "$(janus --shell-init zsh)"`.
 
 /// Поддерживаемые оболочки.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -24,8 +24,8 @@ pub fn init(shell: Shell) -> &'static str {
 
 const POSIX: &str = r#"f() {
     local tmp dir
-    tmp="$(mktemp -t fmgr-cwd.XXXXXX)" || return
-    command fmgr --cwd-file "$tmp" "$@"
+    tmp="$(mktemp -t janus-cwd.XXXXXX)" || return
+    command janus --cwd-file "$tmp" "$@"
     dir="$(cat -- "$tmp" 2>/dev/null)"
     rm -f -- "$tmp"
     if [ -n "$dir" ] && [ -d "$dir" ] && [ "$dir" != "$PWD" ]; then
@@ -35,8 +35,8 @@ const POSIX: &str = r#"f() {
 "#;
 
 const FISH: &str = r#"function f
-    set -l tmp (mktemp -t fmgr-cwd.XXXXXX); or return
-    command fmgr --cwd-file $tmp $argv
+    set -l tmp (mktemp -t janus-cwd.XXXXXX); or return
+    command janus --cwd-file $tmp $argv
     set -l dir (cat -- $tmp 2>/dev/null)
     rm -f -- $tmp
     if test -n "$dir" -a -d "$dir" -a "$dir" != "$PWD"
@@ -53,14 +53,14 @@ mod tests {
     fn functions_pass_arguments_and_use_cwd_file() {
         for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
             let text = init(shell);
-            assert!(text.contains("command fmgr --cwd-file"));
+            assert!(text.contains("command janus --cwd-file"));
             assert!(text.contains("cd -- "));
         }
         assert!(init(Shell::Zsh).contains("\"$@\""));
         assert!(init(Shell::Fish).contains("$argv"));
     }
 
-    /// Функция действительно работает в настоящей оболочке: подменяем fmgr
+    /// Функция действительно работает в настоящей оболочке: подменяем janus
     /// скриптом, который пишет директорию в файл, и смотрим, куда попали.
     #[cfg(unix)]
     #[test]
@@ -71,7 +71,7 @@ mod tests {
         let target = tmp.path().join("target dir");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        let fake = bin.join("fmgr");
+        let fake = bin.join("janus");
         std::fs::write(
             &fake,
             format!("#!/bin/sh\nprintf '%s' '{}' > \"$2\"\n", target.display()),

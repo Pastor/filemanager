@@ -1,7 +1,8 @@
-//! fmgr — двухпанельный TUI-файловый менеджер.
+//! Janus — двухпанельный TUI-файловый менеджер.
 
 mod archive;
 mod config;
+mod drives;
 mod editor;
 mod git;
 mod highlight;
@@ -27,7 +28,7 @@ use crate::ui::theme::ThemeName;
 
 /// Аргументы командной строки. Перекрывают значения из файла конфигурации.
 #[derive(Debug, Parser)]
-#[command(name = "fmgr", version, about = "Two-panel terminal file manager")]
+#[command(name = "janus", version, about = "Two-panel terminal file manager")]
 struct Args {
     /// Directories for the left and right panels (default: current directory).
     #[arg(num_args = 0..=2)]
@@ -67,6 +68,9 @@ fn main() -> Result<()> {
         }
     };
 
+    // Ключи командной строки действуют только на этот запуск: в файл при
+    // выходе вернутся прежние тема и язык.
+    let stored_look = (cfg.theme, cfg.lang);
     if let Some(theme) = args.theme {
         cfg.theme = theme;
     }
@@ -91,7 +95,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| left.clone()),
     };
 
-    let last = ui::run(left, right, cfg, cfg_ok)?;
+    let last = ui::run(left, right, cfg, cfg_ok, stored_look)?;
     // Оболочка читает файл после выхода и переходит в эту директорию: сама
     // программа сменить каталог родительского процесса не может.
     if let Some(file) = args.cwd_file {

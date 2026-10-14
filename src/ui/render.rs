@@ -64,6 +64,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Pack(form) => draw_pack(frame, main, form, &app.theme, app.text()),
         Mode::Help { scroll } => draw_help(frame, area, *scroll, &app.theme, app.text()),
         Mode::Settings(form) => draw_settings(frame, main, form.field, app),
+        Mode::Drives(form) => draw_drives(frame, main, form, &app.theme, app.text()),
     }
 }
 
@@ -456,6 +457,7 @@ fn mode_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Mode::Pack(_) => pack_hints(t),
         Mode::Help { .. } => vec![("↑↓", t.hint_scroll), ("Esc q", t.hint_close)],
         Mode::Settings(_) => settings_hints(t),
+        Mode::Drives(_) => drives_hints(t),
         Mode::ConfirmDelete { permanent, .. } => vec![
             (if *permanent { "D" } else { "d" }, t.confirm),
             ("Esc q", t.cancel),
@@ -517,6 +519,8 @@ fn files_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     hints.push((".", t.hint_hidden));
     hints.push(("o", t.hint_settings));
     hints.push(("q", t.hint_quit));
+    // Последним: в узком окне уступает место выходу, полный список — в справке.
+    hints.push(("g", t.hint_drives));
     hints
 }
 
@@ -671,6 +675,107 @@ fn draw_settings(frame: &mut Frame, area: Rect, selected: usize, app: &App) {
         theme.border(true),
         &theme,
     );
+}
+
+/// Клавиши окна дисков.
+fn drives_hints(t: &'static Text) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("↑↓", t.hint_move),
+        ("Enter", t.hint_goto),
+        ("Esc q", t.cancel),
+    ]
+}
+
+/// Ширина полосы заполнения диска.
+const DRIVE_BAR: usize = 10;
+
+/// Окно выбора диска: имя, тип, полоса заполнения, свободное место, метка.
+fn draw_drives(
+    frame: &mut Frame,
+    area: Rect,
+    form: &crate::ui::DrivesForm,
+    theme: &Theme,
+    t: &'static Text,
+) {
+    use crate::drives::Kind as DriveKind;
+    let name_width = form
+        .drives
+        .iter()
+        .map(|d| d.name.width())
+        .max()
+        .unwrap_or(0)
+        .min(16);
+    let kind_label = |kind: DriveKind| match kind {
+        DriveKind::Fixed => t.drive_fixed,
+        DriveKind::Removable => t.drive_removable,
+        DriveKind::Network => t.drive_network,
+        DriveKind::Optical => t.drive_optical,
+        DriveKind::Home => t.drive_home,
+        DriveKind::Other => t.drive_other,
+    };
+    let kind_width = form
+        .drives
+        .iter()
+        .map(|d| kind_label(d.kind).width())
+        .max()
+        .unwrap_or(0);
+    // Рамка, отступ, пустая строка и подсказки — не больше, чем влезает.
+    let rows = (area.height as usize).saturating_sub(5).max(1);
+    let first = form.selected.saturating_sub(rows - 1);
+    let mut body: Vec<Line> = form
+        .drives
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, drive)| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<name_width$}  ", fit(&drive.name, "", name_width)),
+                    theme.dir(),
+                ),
+                Span::styled(
+                    format!("{:<kind_width$}  ", kind_label(drive.kind)),
+                    theme.dim(),
+                ),
+            ];
+            match drive.space {
+                Some(space) if space.total > 0 => {
+                    let used = space.total.saturating_sub(space.free);
+                    let filled = (used as u128 * DRIVE_BAR as u128 / space.total as u128) as usize;
+                    let share = crate::ui::theme::heat_t(used, space.total);
+                    spans.push(Span::styled("█".repeat(filled), theme.heat(share)));
+                    spans.push(Span::styled("░".repeat(DRIVE_BAR - filled), theme.dim()));
+                    spans.push(Span::raw(format!(
+                        "  {:>8} {} {:>8}",
+                        format_size(space.free),
+                        t.free_of,
+                        format_size(space.total)
+                    )));
+                }
+                _ => spans.push(Span::styled(" ".repeat(DRIVE_BAR), theme.dim())),
+            }
+            if !drive.label.is_empty() {
+                spans.push(Span::styled(format!("  {}", drive.label), theme.dim()));
+            } else if drive.path.as_os_str() != drive.name.as_str() {
+                // В Unix имя — последняя часть пути; полный путь — подсказкой.
+                spans.push(Span::styled(
+                    format!("  {}", display_path(&drive.path)),
+                    theme.dim(),
+                ));
+            }
+            let line = Line::from(spans);
+            if i == form.selected {
+                line.patch_style(theme.cursor(true))
+            } else {
+                line
+            }
+        })
+        .collect();
+    let inner = dialog_inner(area);
+    body.push(Line::raw(""));
+    body.push(hint_line(&drives_hints(t), inner, theme));
+    dialog(frame, area, t.drives_title, body, theme.border(true), theme);
 }
 
 /// Ширина полосы доли в режиме «большие объекты».

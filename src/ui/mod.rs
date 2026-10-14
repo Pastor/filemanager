@@ -17,9 +17,10 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use crate::archive::Format;
 use crate::config::{Config, LEFT_PCT_STEP, Side, clamp_left_pct};
+use crate::drives::{self, Drive};
 use crate::editor::{Editor, OpenError};
 use crate::git;
-use crate::i18n::Text;
+use crate::i18n::{Lang, Text};
 use crate::ops::{self, Choice, Problem, Report, Transfer};
 use crate::panel::{Panel, in_archive, mount_base};
 use crate::preview::{Body, Loader, Preview};
@@ -28,7 +29,7 @@ use crate::ui::finder::Finder;
 use crate::ui::help::{Field, SettingsForm};
 use crate::ui::job::{Job, JobKind, JobMsg};
 use crate::ui::large::Large;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, ThemeName};
 use crate::ui::viewer::{HSCROLL_STEP, Viewer};
 
 /// Сколько ждать загрузчик просмотра, прежде чем счесть его зависшим.
@@ -62,6 +63,15 @@ pub enum Mode {
     Help { scroll: usize },
     /// Окно настроек.
     Settings(SettingsForm),
+    /// Выбор диска для активной панели.
+    Drives(DrivesForm),
+}
+
+/// Окно выбора диска.
+pub struct DrivesForm {
+    pub drives: Vec<Drive>,
+    /// Индекс выбранного диска.
+    pub selected: usize,
 }
 
 /// Форма создания архива.
@@ -101,6 +111,9 @@ pub struct App {
     /// Сохранять конфиг при выходе: `false`, если файл был испорчен и
     /// пользователь ещё не сохранил настройки явно.
     pub save_config: bool,
+    /// Тема и язык, которые пишутся в файл. Ключи `-t` / `-l` меняют их только
+    /// на этот запуск; постоянными они становятся после сохранения настроек.
+    stored_look: (ThemeName, Lang),
     /// Панель просмотра, если открыта. Она занимает место одной из панелей.
     pub viewer: Option<Viewer>,
     /// С какого момента просмотр ждёт загрузчик — чтобы не ждать вечно.
@@ -144,11 +157,12 @@ impl App {
             active: Side::Left,
             hidden: session.hidden.filter(|&side| side != Side::Left),
             left_pct: clamp_left_pct(session.left_pct),
-            cfg,
             theme,
             status,
             mode: Mode::Normal,
             save_config: true,
+            stored_look: (cfg.theme, cfg.lang),
+            cfg,
             viewer: None,
             editor: None,
             loading_since: None,
@@ -240,6 +254,7 @@ impl App {
             Mode::Pack(_) => return self.on_pack_key(key.code),
             Mode::Help { .. } => return self.on_help_key(key.code),
             Mode::Settings(_) => return self.on_settings_key(key.code),
+            Mode::Drives(_) => return self.on_drives_key(key.code),
         }
         // Редактор сам разбирает сочетания с Ctrl.
         if self.editor.is_some() {
@@ -343,10 +358,15 @@ impl App {
             }
             KeyCode::Left => {
                 let target = self.active_panel().dir.parent().map(PathBuf::from);
-                if let Err(err) = self.active_panel().leave(show_hidden)
-                    && let Some(dir) = target
-                {
-                    self.fail_open(dir, err);
+                match self.active_panel().leave(show_hidden) {
+                    // Выше корня — другие диски: в Windows иначе на них не попасть.
+                    Ok(false) => self.open_drives(),
+                    Ok(true) => {}
+                    Err(err) => {
+                        if let Some(dir) = target {
+                            self.fail_open(dir, err);
+                        }
+                    }
                 }
             }
             KeyCode::Tab => {
@@ -394,6 +414,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help { scroll: 0 },
             KeyCode::Char('o') => self.open_settings(),
+            KeyCode::Char('g') => self.open_drives(),
             _ => {}
         }
     }
@@ -1030,6 +1051,8 @@ impl App {
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
                 self.store_session();
+                // Явно сохранённые тема и язык — уже не разовое переопределение.
+                self.stored_look = (self.cfg.theme, self.cfg.lang);
                 match self.cfg.save() {
                     Ok(path) => {
                         // Явное сохранение — согласие перезаписать и испорченный файл.
@@ -1071,6 +1094,63 @@ impl App {
         }
         if before.show_hidden != self.cfg.show_hidden {
             self.refresh_panels();
+        }
+    }
+
+    /// Открывает окно выбора диска; курсор — на диске активной панели.
+    fn open_drives(&mut self) {
+        let drives = drives::list();
+        if drives.is_empty() {
+            let text = self.text().no_drives;
+            self.fail(text);
+            return;
+        }
+        // Изнутри архива панель «стоит» там, где лежит сам архив.
+        let panel = self.panel(self.active);
+        let dir = panel.display_dir();
+        let selected = drives::containing(&drives, &dir).unwrap_or(0);
+        self.mode = Mode::Drives(DrivesForm { drives, selected });
+    }
+
+    /// Клавиши окна дисков: ↑↓ — выбор, Enter и → — перейти, Esc — закрыть.
+    /// В Windows буква диска сразу переходит на него (кроме `q` — это Esc).
+    fn on_drives_key(&mut self, code: KeyCode) {
+        let Mode::Drives(form) = &mut self.mode else {
+            return;
+        };
+        let last = form.drives.len().saturating_sub(1);
+        match code {
+            KeyCode::Up => form.selected = form.selected.saturating_sub(1),
+            KeyCode::Down => form.selected = (form.selected + 1).min(last),
+            KeyCode::Home | KeyCode::PageUp => form.selected = 0,
+            KeyCode::End | KeyCode::PageDown => form.selected = last,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => self.mode = Mode::Normal,
+            KeyCode::Enter | KeyCode::Right => self.go_drive(None),
+            KeyCode::Char(c) if cfg!(windows) && c.is_ascii_alphabetic() => {
+                let name = format!("{}:", c.to_ascii_uppercase());
+                if let Some(i) = form.drives.iter().position(|d| d.name == name) {
+                    self.go_drive(Some(i));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Закрывает окно дисков и открывает в активной панели выбранный диск
+    /// (или диск `index`).
+    fn go_drive(&mut self, index: Option<usize>) {
+        let Mode::Drives(form) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+        let Some(drive) = form.drives.into_iter().nth(index.unwrap_or(form.selected)) else {
+            return;
+        };
+        if drive.path == self.panel(self.active).dir {
+            return;
+        }
+        let show = self.cfg.show_hidden;
+        if let Err(err) = self.active_panel().cd(drive.path.clone(), show) {
+            self.fail_open(drive.path, err);
         }
     }
 
@@ -1244,6 +1324,14 @@ impl App {
     }
 
     /// Переносит состояние окна в конфиг перед сохранением.
+    /// Конфиг для записи при выходе: с темой и языком из файла, а не из
+    /// ключей командной строки.
+    fn config_to_save(&self) -> Config {
+        let mut cfg = self.cfg.clone();
+        (cfg.theme, cfg.lang) = self.stored_look;
+        cfg
+    }
+
     fn store_session(&mut self) {
         let session = &mut self.cfg.session;
         session.right = Some(self.panels[Side::Right as usize].dir.clone());
@@ -1288,9 +1376,18 @@ fn spawn_events() -> Receiver<Event> {
 /// `cfg_ok` — конфиг прочитан без ошибок. Если нет, файл не перезаписывается:
 /// иначе одна опечатка стоила бы пользователю всех его настроек.
 /// Возвращает директорию активной панели на момент выхода.
-pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<PathBuf> {
+/// `stored_look` — тема и язык из файла настроек, до переопределения ключами
+/// командной строки: при выходе в файл пишутся они.
+pub fn run(
+    left: PathBuf,
+    right: PathBuf,
+    cfg: Config,
+    cfg_ok: bool,
+    stored_look: (ThemeName, Lang),
+) -> Result<PathBuf> {
     let mut app = App::new(left, right, cfg);
     app.save_config = cfg_ok;
+    app.stored_look = stored_look;
     let mut terminal = ratatui::init();
     // Паники загрузчика перехватываются в нём самом; обработчик ratatui при этом
     // восстановил бы терминал и сломал экран работающей программы.
@@ -1309,7 +1406,7 @@ pub fn run(left: PathBuf, right: PathBuf, cfg: Config, cfg_ok: bool) -> Result<P
 
     if app.save_config {
         app.store_session();
-        if let Err(err) = app.cfg.save() {
+        if let Err(err) = app.config_to_save().save() {
             eprintln!("{}: {err:#}", app.text().config_not_saved);
         }
     }
@@ -2331,5 +2428,50 @@ mod tests {
             panic!("ожидался текст");
         };
         assert_eq!(text.plain(0), "@SpringBootApplication");
+    }
+
+    #[test]
+    fn drives_dialog_opens_and_switches_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(tmp.path());
+        press(&mut app, KeyCode::Char('g'));
+        let Mode::Drives(form) = &app.mode else {
+            panic!("ожидалось окно дисков");
+        };
+        // Курсор стоит на диске, где открыта панель.
+        let here = &form.drives[form.selected];
+        assert!(tmp.path().starts_with(&here.path));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Normal));
+
+        // Первый диск — корень (в Unix `/`): переходим на него.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        let root = app.panel(app.active).dir.clone();
+        assert!(root.parent().is_none(), "{}", root.display());
+
+        // ← в корне открывает то же окно.
+        press(&mut app, KeyCode::Left);
+        assert!(matches!(app.mode, Mode::Drives(_)));
+    }
+
+    #[test]
+    fn command_line_look_is_not_saved_unless_settings_are_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(tmp.path());
+        // Как после `-t nord -l ru` при светлой английской теме в файле.
+        app.stored_look = (ThemeName::Light, Lang::En);
+        app.cfg.theme = ThemeName::Nord;
+        app.cfg.lang = Lang::Ru;
+        let saved = app.config_to_save();
+        assert_eq!((saved.theme, saved.lang), (ThemeName::Light, Lang::En));
+        assert_eq!(saved.session.right_columns, app.cfg.session.right_columns);
+
+        // Сохранение в окне настроек делает выбор постоянным.
+        app.stored_look = (app.cfg.theme, app.cfg.lang);
+        let saved = app.config_to_save();
+        assert_eq!((saved.theme, saved.lang), (ThemeName::Nord, Lang::Ru));
     }
 }
