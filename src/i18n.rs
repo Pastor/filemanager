@@ -209,6 +209,15 @@ pub struct Text {
     pub free_of: &'static str,
     pub no_drives: &'static str,
 
+    // Переименование.
+    pub hint_rename: &'static str,
+    pub help_rename: &'static str,
+    pub rename_title: &'static str,
+    pub rename_invalid: &'static str,
+    pub rename_exists: &'static str,
+    pub rename_failed: &'static str,
+    pub renamed: &'static str,
+
     // Справка и настройки.
     pub hint_help: &'static str,
     pub hint_settings: &'static str,
@@ -411,6 +420,14 @@ pub static EN: Text = Text {
     free_of: "free of",
     no_drives: "no drives found",
 
+    hint_rename: "rename",
+    help_rename: "rename the item under the cursor",
+    rename_title: "Rename",
+    rename_invalid: "invalid name",
+    rename_exists: "already exists",
+    rename_failed: "cannot rename",
+    renamed: "renamed to",
+
     hint_help: "help",
     hint_settings: "settings",
     hint_change: "change",
@@ -611,6 +628,14 @@ pub static RU: Text = Text {
     drive_other: "другой",
     free_of: "свободно из",
     no_drives: "диски не найдены",
+
+    hint_rename: "переименовать",
+    help_rename: "переименовать элемент под курсором",
+    rename_title: "Переименование",
+    rename_invalid: "недопустимое имя",
+    rename_exists: "уже существует",
+    rename_failed: "не удалось переименовать",
+    renamed: "новое имя",
 
     hint_help: "справка",
     hint_settings: "настройки",

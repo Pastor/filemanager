@@ -35,6 +35,7 @@ pub fn sections(t: &'static Text) -> Vec<Section> {
                 ("d", t.help_trash),
                 ("D", t.help_delete),
                 ("a", t.help_pack),
+                ("r  F2", t.help_rename),
             ],
         ),
         (

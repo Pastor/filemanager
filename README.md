@@ -19,6 +19,7 @@ the keyboard, with every long operation running in the background.
 - [Editor](#editor)
 - [Search](#search)
 - [Copy, move, delete](#copy-move-delete)
+- [Rename](#rename)
 - [Archives](#archives)
 - [Largest objects](#largest-objects)
 - [Drives and volumes](#drives-and-volumes)
@@ -38,7 +39,8 @@ the keyboard, with every long operation running in the background.
   language defaults).
 - Background search by content and by name over the whole subtree, results
   shown live in the preview.
-- Copy / move with progress and a conflict dialog; delete to trash or permanently.
+- Copy / move with progress and a conflict dialog; delete to trash or permanently;
+  rename in place.
 - Archives open like directories (zip, tar, gz, tar.gz, tar.zst; rar/7z through
   external tools) and can be created from marked files.
 - "Largest objects" mode: recursive sizes, share bars and a heat-map gradient.
@@ -196,6 +198,25 @@ the search.
 |---|---|
 | ![Conflict](docs/media/en/conflict.png) | ![Delete](docs/media/en/delete.png) |
 
+## Rename
+
+![Rename](docs/media/en/rename.gif)
+
+`r` (or `F2`) renames the file or directory under the cursor right in the panel.
+
+- The cursor starts before the extension: `report|.pdf` — usually you change the
+  name, not the type. For directories and names like `.gitignore` it starts at the end.
+- `←` `→` `Home` `End` move inside the name, `Backspace` / `Delete` erase,
+  any letters (Cyrillic included) are typed as text. `Enter` renames, `Esc` cancels.
+- After renaming, the cursor stays on the item under its new name, and the other
+  panel is refreshed if it shows the same directory.
+- An existing name is never overwritten: the status line says "already exists".
+  Changing only the case (`readme.md` → `README.md`) works on case-insensitive
+  file systems too. Names with `/` (and `\ : * ? " < > |` on Windows) are rejected.
+- Archives are read-only, so renaming inside an open archive is not allowed.
+
+![Rename dialog](docs/media/en/rename.png)
+
 ## Archives
 
 ![Archives](docs/media/en/archive.gif)
@@ -333,6 +354,7 @@ input it is just a letter.
 |---|---|
 | `Space` | Mark |
 | `c` / `m` | Copy / move to the other panel |
+| `r` `F2` | Rename |
 | `d` / `D` | Delete to trash / permanently |
 | `a` | Create an archive |
 | `p` | Preview |
